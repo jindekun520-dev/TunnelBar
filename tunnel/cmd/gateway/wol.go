@@ -52,30 +52,8 @@ func (c *WOLConfig) normalize() {
 	}
 }
 
-// assetKey 是门户按钮回传的资产标识：优先子域名，其次名字。
-func assetKey(a *Asset) string {
-	if a.Sub != "" {
-		return a.Sub
-	}
-	return a.Name
-}
-
-// assetByKey 按门户回传的标识找资产。
-func (g *Gateway) assetByKey(k string) *Asset {
-	if k == "" {
-		return nil
-	}
-	for i := range g.cfg.Assets {
-		a := &g.cfg.Assets[i]
-		if a.Sub != "" && a.Sub == k {
-			return a
-		}
-		if a.Name == k {
-			return a
-		}
-	}
-	return nil
-}
+// assetKey / assetByKey 在 assets.go：资产表现在是运行时可变的，
+// 查表要过那把读写锁，放在资产那堆逻辑里更不容易被绕过。
 
 // wolClient 返回一个走 SOCKS 的短超时 HTTP 客户端。
 func (g *Gateway) wolClient() *http.Client {

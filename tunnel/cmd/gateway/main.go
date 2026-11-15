@@ -47,23 +47,28 @@ import (
 //     ESXi / 飞牛这类绝对路径 + WebSocket 的前端完全不用改。
 //   - Sub 非空：走子域名（esxi.example.com），一台端口都不用多开，
 //     但需要泛域名证书（*.example.com）或每台各签一张。
+//
+// 可选字段一律 omitempty：这份结构体会被门户的资产管理页写回
+// gateway.json（persistAssets），没有 omitempty 的话，一台只有子域名的
+// 资产也会被写成 "port": 0 / "public_port": 0 / "check": ""，
+// 手写配置文件的人会以为这些字段是必须的。
 type Asset struct {
-	Sub    string `json:"sub"`    // 子域名前缀，如 esxi → esxi.example.com
-	Port   int    `json:"port"`   // 独立监听端口；0 表示只走子域名
-	Name   string `json:"name"`   // 门户上显示的名字
-	Target string `json:"target"` // 内网地址 host:port
-	Scheme string `json:"scheme"` // 后端协议 http / https
-	Note   string `json:"note"`   // 门户上的一行说明
-	Icon   string `json:"icon"`   // 门户上的字符图标（避免用图片，老浏览器也能显示）
+	Sub    string `json:"sub,omitempty"`    // 子域名前缀，如 esxi → esxi.example.com
+	Port   int    `json:"port,omitempty"`   // 独立监听端口；0 表示只走子域名
+	Name   string `json:"name"`             // 门户上显示的名字
+	Target string `json:"target"`           // 内网地址 host:port
+	Scheme string `json:"scheme,omitempty"` // 后端协议 http / https（留空按 https）
+	Note   string `json:"note,omitempty"`   // 门户上的一行说明
+	Icon   string `json:"icon,omitempty"`   // 门户上的字符图标（避免用图片，老浏览器也能显示）
 	// 防火墙把外部端口映射成别的号时（比如外 9444 → 内 8444），
 	// 填这里，门户链接与 Location 重写才会用对外的号。留空 = 与 Port 相同。
-	PubPort int `json:"public_port"`
+	PubPort int `json:"public_port,omitempty"`
 	// MAC 填了之后，门户上这台资产会多一个「唤醒」按钮（网络唤醒 / WOL）。
 	// 魔术包由 home 端在内网广播出去——网关在公网上发不到目标网段。
-	MAC string `json:"mac"`
+	MAC string `json:"mac,omitempty"`
 	// 唤醒后用来判断「起来了没有」的地址，默认取 Target。
 	// 一台机器常常有多个身份（3389 的 PC 和 ssh 的同一台），填这个可以指定探哪个。
-	Check string `json:"check"`
+	Check string `json:"check,omitempty"`
 }
 
 type Config struct {
@@ -288,14 +293,31 @@ type Gateway struct {
 	passMu   sync.RWMutex
 	passHash string
 	passTag  string
+
+	// 运行时资产表。门户里能新增/修改/删除资产，所以这张表会被整体替换；
+	// cfg.Assets 只在启动时和每次保存后与它对齐（持久化时需要用整份配置）。
+	assetsMu sync.RWMutex
+	assets   []Asset
+	// 配置文件路径，资产改动要写回它
+	cfgPath string
+	// 资产端口绑定的地址与 TLS 配置：运行时新开端口要用同一个
+	bindHost string
+	tlsCfg   *tls.Config
+	// 独立端口资产的实际监听器，port → server
+	portMu sync.Mutex
+	ports  map[int]*http.Server
 }
 
 func NewGateway(cfg *Config) *Gateway {
+	assets := make([]Asset, len(cfg.Assets))
+	copy(assets, cfg.Assets)
 	return &Gateway{
 		cfg:         cfg,
 		dialer:      &socksDialer{addr: cfg.Socks},
 		proxies:     make(map[string]*httputil.ReverseProxy),
 		insecureTLS: &tls.Config{InsecureSkipVerify: true},
+		assets:      assets,
+		ports:       make(map[int]*http.Server),
 	}
 }
 
@@ -334,15 +356,6 @@ func (g *Gateway) pubURL(a *Asset) string {
 		return "#"
 	}
 	return "https://" + g.pubHost(a) + "/"
-}
-
-func (g *Gateway) findAssetBySub(sub string) *Asset {
-	for i := range g.cfg.Assets {
-		if g.cfg.Assets[i].Sub == sub {
-			return &g.cfg.Assets[i]
-		}
-	}
-	return nil
 }
 
 // proxyFor 为某台资产建（并缓存）一条反向代理。key 区分「子域名入口」和「端口入口」，
@@ -421,22 +434,8 @@ func (g *Gateway) proxyFor(key string, a *Asset) *httputil.ReverseProxy {
 	return rp
 }
 
-// assetHandler 是「一个端口一台资产」的入口：进了这个端口，所有路径都归它。
-func (g *Gateway) assetHandler(a *Asset) http.Handler {
-	rp := g.proxyFor("port:"+strconv.Itoa(a.Port), a)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/__health" {
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			io.WriteString(w, "ok\n")
-			return
-		}
-		if !g.authed(r) {
-			g.showLogin(w, r, "", http.StatusUnauthorized)
-			return
-		}
-		rp.ServeHTTP(w, r)
-	})
-}
+// 「一个端口一台资产」的入口见 assets.go 的 assetHandlerByPort：
+// 那里每次请求都现查资产表，改完 target 不用重建 handler。
 
 // ---------------------------------------------------------------- 登录
 
@@ -530,6 +529,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if path == "/__wolstatus" {
 		g.handleWOLStatus(w, r)
+		return
+	}
+
+	// 资产管理：门户底部「管理资产」那一页（新增 / 修改 / 删除）
+	if path == "/__assets" {
+		g.handleAssets(w, r)
 		return
 	}
 
@@ -738,10 +743,15 @@ form{max-width:360px;margin:8vh auto 0}
 .foot{color:#aaa;font-size:12px;text-align:center;margin-top:24px}
 </style>`
 
-func pageTpl(title, body string) string {
+func pageTpl(title, body string) string { return pageWith(title, "", body) }
+
+// pageWith 允许某个页面追加自己的 CSS。
+// 登录/门户那套样式里有 form / input / button 的全局规则（登录框要整宽），
+// 管理页是表单页，硬套会把输入框挤成一条，所以单独给一段。
+func pageWith(title, extraCSS, body string) string {
 	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">` +
 		`<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">` +
-		`<title>` + html.EscapeString(title) + `</title>` + styleTpl +
+		`<title>` + html.EscapeString(title) + `</title>` + styleTpl + extraCSS +
 		`</head><body>` + body + `</body></html>`
 }
 
@@ -764,8 +774,7 @@ func (g *Gateway) showLogin(w http.ResponseWriter, r *http.Request, errMsg strin
 }
 
 func (g *Gateway) portal(w http.ResponseWriter, r *http.Request) {
-	list := make([]Asset, len(g.cfg.Assets))
-	copy(list, g.cfg.Assets)
+	list := g.assetList()
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 
 	var b strings.Builder
@@ -833,6 +842,11 @@ func (g *Gateway) portal(w http.ResponseWriter, r *http.Request) {
 		b.WriteString(`<div class="nt">远程桌面 / 终端</div></div></div></a>`)
 	}
 
+	// 资产管理：加一台机器不用再 SSH 上去改配置文件
+	b.WriteString(`<a class="card" href="/__assets"><div class="row">`)
+	b.WriteString(`<div class="ico">+</div><div><div class="nm">管理资产</div>`)
+	b.WriteString(`<div class="nt">新增 / 修改 / 删除内网入口 · 保存即生效</div></div></div></a>`)
+
 	// 账号维护入口，放最后一行
 	b.WriteString(`<a class="card" href="/__passwd"><div class="row">`)
 	b.WriteString(`<div class="ico">K</div><div><div class="nm">修改密码</div>`)
@@ -846,6 +860,8 @@ func (g *Gateway) portal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 刚在管理页加完资产，切回门户不能看到旧的一份
+	w.Header().Set("Cache-Control", "no-store")
 	io.WriteString(w, pageTpl("内网入口", b.String()))
 }
 
@@ -892,31 +908,33 @@ func main() {
 		}
 	}
 
-	// 先把要监听的端口全部列出来，任何一个绑不上就直接退出，
-	// 免得“一半起来了”这种最难查的状态。
-	type endpoint struct {
-		addr string
-		h    http.Handler
-		tag  string
-	}
-	var eps []endpoint
-	eps = append(eps, endpoint{cfg.Listen, gw, "门户"})
-	used := map[int]bool{}
+	// 把「运行时新增资产」需要的东西交给网关：配置文件路径（改动要写回）、
+	// 资产端口的绑定地址、以及和门户共用的 TLS 配置。
+	gw.cfgPath = *cfgPath
+	gw.bindHost = bindHost
+	gw.tlsCfg = tlsCfg
+
+	// 资产端口先全部绑一遍，任何一个绑不上就直接退出，
+	// 免得「一半起来了」这种最难查的状态。运行时新增的端口走同一个 startPort。
+	seenPort := map[int]bool{}
+	assetPorts := 0
 	for i := range cfg.Assets {
 		a := &cfg.Assets[i]
 		if a.Port <= 0 {
 			continue
 		}
-		if used[a.Port] {
+		if seenPort[a.Port] {
 			log.Fatalf("资产 %q 的端口 %d 重复了", a.Name, a.Port)
 		}
-		used[a.Port] = true
-		addr := net.JoinHostPort(bindHost, strconv.Itoa(a.Port))
-		eps = append(eps, endpoint{addr, gw.assetHandler(a), a.Name})
+		seenPort[a.Port] = true
+		if err := gw.startPort(a.Port); err != nil {
+			log.Fatalf("资产 %q 的端口 %d 监听失败：%v", a.Name, a.Port, err)
+		}
+		assetPorts++
 	}
 
-	log.Printf("网关启动，域名 %s，%d 个资产，SOCKS %s，HTTPS=%v",
-		cfg.Domain, len(cfg.Assets), cfg.Socks, tlsCfg != nil)
+	log.Printf("网关启动，域名 %s，%d 个资产（%d 个独立端口），SOCKS %s，HTTPS=%v",
+		cfg.Domain, len(cfg.Assets), assetPorts, cfg.Socks, tlsCfg != nil)
 	for i := range cfg.Assets {
 		a := &cfg.Assets[i]
 		log.Printf("  %-32s %s://%s  (%s)", gw.endpointOf(a), a.Scheme, a.Target, a.Name)
@@ -942,30 +960,29 @@ func main() {
 			cfg.WOL.Endpoint, n, cfg.WOL.WaitSeconds)
 	}
 
-	for _, ep := range eps {
-		ln, err := net.Listen("tcp", ep.addr)
-		if err != nil {
-			log.Fatalf("[%s] 监听 %s 失败：%v", ep.tag, ep.addr, err)
-		}
-		log.Printf("[%s] 已监听 %s", ep.tag, ep.addr)
-		srv := &http.Server{
-			Addr:              ep.addr,
-			Handler:           ep.h,
-			ReadHeaderTimeout: 15 * time.Second,
-			// 不设 WriteTimeout：WebSocket 和长下载会被砍断
-			IdleTimeout: 120 * time.Second,
-			TLSConfig:   tlsCfg,
-		}
-		go func(ep endpoint, ln net.Listener, srv *http.Server) {
-			var err error
-			if tlsCfg != nil {
-				err = srv.ServeTLS(ln, "", "")
-			} else {
-				err = srv.Serve(ln)
-			}
-			log.Printf("[%s] %s 退出：%v", ep.tag, ep.addr, err)
-		}(ep, ln, srv)
+	// 门户自己。资产端口已经在上面由 gw.startPort 起好了（运行时新增的也走同一条路）
+	pubLn, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		log.Fatalf("[门户] 监听 %s 失败：%v", cfg.Listen, err)
 	}
+	log.Printf("[门户] 已监听 %s", cfg.Listen)
+	portalSrv := &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           gw,
+		ReadHeaderTimeout: 15 * time.Second,
+		// 不设 WriteTimeout：WebSocket 和长下载会被砍断
+		IdleTimeout: 120 * time.Second,
+		TLSConfig:   tlsCfg,
+	}
+	go func() {
+		var serr error
+		if tlsCfg != nil {
+			serr = portalSrv.ServeTLS(pubLn, "", "")
+		} else {
+			serr = portalSrv.Serve(pubLn)
+		}
+		log.Printf("[门户] %s 退出：%v", cfg.Listen, serr)
+	}()
 
 	if tlsCfg == nil {
 		log.Printf("注意：未配置证书，当前是明文 HTTP")
