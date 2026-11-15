@@ -1,0 +1,25 @@
+[Unit]
+Description=Tunnel Relay - 公网中继（client 与 home 的会合点）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 部署时改为服务器上的实际路径
+ExecStart=/usr/local/bin/tunnel-relay -home 7000 -client 7100 -key 在此填入与两端一致的预共享密钥 -status 127.0.0.1:9911
+Restart=always
+RestartSec=3
+
+# 转发表常驻，内存按并发流数量增长；个人使用 256M 足够，量大可上调
+MemoryMax=256M
+# 打开文件数 = 并发流数量，个人使用 4096 充裕
+LimitNOFILE=4096
+
+# 基础加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

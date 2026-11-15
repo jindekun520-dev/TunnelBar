@@ -1,0 +1,50 @@
+{
+  "listen": "0.0.0.0:8443",
+  "bind": "",
+  "socks": "127.0.0.1:1080",
+  "domain": "example.com",
+  "portal_sub": "portal",
+  "public_port": 8443,
+  "user": "admin",
+  "password": "换成你的初始密码（首次启动后即被忽略）",
+  "secret": "换成 openssl rand -hex 32 的输出",
+  "passwd_file": "/etc/tunnelbar/passwd",
+  "tls_cert": "/etc/letsencrypt/live/example.com/fullchain.pem",
+  "tls_key": "/etc/letsencrypt/live/example.com/privkey.pem",
+  "assets": [
+    {
+      "sub": "esxi",
+      "name": "ESXi 宿主机",
+      "target": "10.0.0.10:443",
+      "scheme": "https",
+      "icon": "▣",
+      "note": "虚拟化 · 10.0.0.10"
+    },
+    {
+      "sub": "nas",
+      "name": "NAS 管理",
+      "target": "10.0.0.11:5001",
+      "scheme": "https",
+      "icon": "▤",
+      "note": "存储 · 10.0.0.11"
+    },
+    {
+      "sub": "router",
+      "name": "路由器",
+      "target": "10.0.0.1:443",
+      "scheme": "https",
+      "icon": "◇",
+      "note": "网关设备"
+    }
+  ],
+  "paths": {
+    "/guacamole/": "http://127.0.0.1:8089"
+  },
+  "extra": {},
+  "guacamole": {
+    "path": "/guacamole/",
+    "target": "http://127.0.0.1:8089",
+    "user": "gcuser",
+    "password": "换成 user-mapping.xml 里的账号密码"
+  }
+}

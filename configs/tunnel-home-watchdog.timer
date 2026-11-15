@@ -1,0 +1,9 @@
+[Unit]
+Description=Tunnel Home 看门狗定时器（每分钟检查一次）
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+
+[Install]
+WantedBy=timers.target

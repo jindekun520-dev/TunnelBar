@@ -1,0 +1,24 @@
+[Unit]
+Description=Tunnel Home - 家里主机到中继的反向隧道
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 部署时改为家里机器上的实际路径
+ExecStart=/usr/local/bin/tunnel-home -relay 203.0.113.10:7000 -key 在此填入与两端一致的预共享密钥 -status /run/tunnel-home.status
+Restart=always
+RestartSec=3
+RestartSteps=5
+RestartMaxDelaySec=60
+
+OnFailure=/usr/local/bin/tunnel-home-alert.sh
+
+MemoryMax=192M
+LimitNOFILE=4096
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
