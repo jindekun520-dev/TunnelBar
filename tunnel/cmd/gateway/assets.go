@@ -194,7 +194,7 @@ func (g *Gateway) assetHandlerByPort(p int) http.Handler {
 			return
 		}
 		if !g.authed(r) {
-			g.showLogin(w, r, "", http.StatusUnauthorized)
+			g.showLogin(w, r, "", false, http.StatusUnauthorized)
 			return
 		}
 		a := g.assetByPort(p)

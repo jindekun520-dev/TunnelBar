@@ -296,7 +296,8 @@ ssh -o ProxyCommand="nc -x 127.0.0.1:1080 %h %p" root@10.0.0.12
 - 用**泛域名证书** `*.example.com`（裸域名不被覆盖，所以门户必须挂在 `portal.` 子域上）；
 - 只有 1 个端口需要映射，新增资产只加一条 `assets`；
 - `/__health` 无需登录，方便探活；
-- 密码在门户最下面一行可以直接改（`/__passwd`），改完整网所有旧 Cookie 立即失效。
+- 密码在门户最下面一行可以直接改（`/__passwd`），改完整网所有旧 Cookie 立即失效；
+- 门户最底部还有「退出登录」（`/__logout`）：清 Cookie 回登录页，适合车机、借来的电脑这类不是自己的设备。因为 Cookie 在父域上，退出一次各资产子域一起退。
 
 ### 加一台机器，不用再改配置文件
 
@@ -388,6 +389,7 @@ tunnelbar/
 - RDP 密码无法代填（`.rdp` 里必须是 Windows DPAPI 密文，macOS 算不出来），首次需手输并勾选「记住我」。
 - Windows 版客户端尚未提供。
 - 网页端管理资产只管 `assets`：`domain` / `portal_sub` / `socks` / 密码 / `paths` / `extra` 仍要改配置文件并重启（网关不监听文件变化）；手工编辑 `gateway.json` 里的 `assets` 同样需要重启，保存即生效的只有管理页这条路。
+- 网页端「退出登录」只删本机 Cookie，不会让已泄露的 Cookie 值失效（无状态 HMAC，服务端不存会话表）。要立刻作废旧票：改密码或换 `secret` 重启。
 - 规划中：relay 侧流 ID 单调化、Web 端健康检查面板、IPv6 目标、把 `paths` / `extra` 也搬进管理页。
 
 ---

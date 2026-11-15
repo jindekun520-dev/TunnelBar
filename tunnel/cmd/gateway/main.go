@@ -511,8 +511,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 退出登录：清掉 Cookie 回登录页。故意排在登录门前面——Cookie 已经过期
+	// 或签名失效时，「退出」也该安安静静回到登录页，而不是先弹一个 401。
+	if path == "/__logout" {
+		g.handleLogout(w, r)
+		return
+	}
+
 	if !g.authed(r) {
-		g.showLogin(w, r, "", http.StatusUnauthorized)
+		g.showLogin(w, r, "", false, http.StatusUnauthorized)
 		return
 	}
 
@@ -648,11 +655,16 @@ func (g *Gateway) pathProxy(w http.ResponseWriter, r *http.Request, target strin
 
 func (g *Gateway) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		g.showLogin(w, r, "", 0)
+		// 刚点过页底的「退出登录」：给一句话，免得看起来像莫名其妙被踢出来
+		msg := ""
+		if r.URL.Query().Get("out") == "1" {
+			msg = "已退出登录"
+		}
+		g.showLogin(w, r, msg, false, 0)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
-		g.showLogin(w, r, "请求格式不对", http.StatusBadRequest)
+		g.showLogin(w, r, "请求格式不对", true, http.StatusBadRequest)
 		return
 	}
 	u := r.PostFormValue("u")
@@ -662,7 +674,7 @@ func (g *Gateway) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !uOK || !g.verifyPassword(p) {
 		log.Printf("登录失败：来自 %s，用户名 %q", r.RemoteAddr, u)
 		time.Sleep(800 * time.Millisecond) // 拖慢暴力破解
-		g.showLogin(w, r, "账号或密码不对", http.StatusUnauthorized)
+		g.showLogin(w, r, "账号或密码不对", true, http.StatusUnauthorized)
 		return
 	}
 	g.setLoginCookie(w, r)
@@ -700,6 +712,19 @@ func (g *Gateway) clearLoginCookie(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleLogout 清掉登录 Cookie 并回到登录页。
+//
+// 用 GET 而不是 POST：这个动作只是「让本机忘掉这张票」，没有服务端状态要改，
+// 做成链接才能在门户上直接点、也方便车机上长按/回退。代价是别人可以用一张
+// 图片把你顶下线——只影响自己，不泄露任何东西，可以接受。
+func (g *Gateway) handleLogout(w http.ResponseWriter, r *http.Request) {
+	g.clearLoginCookie(w, r)
+	log.Printf("退出登录：来自 %s", r.RemoteAddr)
+	// 门户页本身是 no-store，这里再压一次，避免车机浏览器拿缓存当「还没退出」
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, "/__login?out=1", http.StatusSeeOther)
+}
+
 // ---------------------------------------------------------------- 页面
 
 const styleTpl = `<style>
@@ -733,6 +758,12 @@ h1{font-size:20px;margin:0 0 4px;font-weight:600}
 .wst.bad{color:#b42318}
 .err{color:#b42318;background:#fdecea;border:1px solid #f5c2bd;border-radius:8px;
      padding:10px 12px;margin:0 0 14px}
+/* 正常提示（如「已退出登录」）：绿底，别跟报错一个长相 */
+.tip{color:#0a7d33;background:#e9f6ee;border:1px solid #bfe3ca;border-radius:8px;
+     padding:10px 12px;margin:0 0 14px}
+/* 退出登录：整页唯一一个「减法」操作，用红字跟别的卡片区分开 */
+.card.quit .ico{background:#fdecea;color:#b42318}
+.card.quit .nm{color:#b42318}
 .note{color:#777;font-size:14px}
 input{width:100%;padding:12px;font-size:16px;border:1px solid #ccd0d6;border-radius:8px;
       margin-bottom:12px;background:#fff}
@@ -755,15 +786,21 @@ func pageWith(title, extraCSS, body string) string {
 		`</head><body>` + body + `</body></html>`
 }
 
-func (g *Gateway) showLogin(w http.ResponseWriter, r *http.Request, errMsg string, status int) {
+// showLogin 渲染登录页。msg 会显示在表单上方，msgErr 决定是红底报错
+// 还是绿底提示（「已退出登录」不该长成一副出错的样子）。
+func (g *Gateway) showLogin(w http.ResponseWriter, r *http.Request, msg string, msgErr bool, status int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// 401 但不带 WWW-Authenticate，浏览器只会显示这段 HTML，不会弹 Basic Auth 框
 	if status != 0 {
 		w.WriteHeader(status)
 	}
 	body := `<form method="post" action="/__login">`
-	if errMsg != "" {
-		body += `<p class="err">` + html.EscapeString(errMsg) + `</p>`
+	if msg != "" {
+		cls := "tip"
+		if msgErr {
+			cls = "err"
+		}
+		body += `<p class="` + cls + `">` + html.EscapeString(msg) + `</p>`
 	}
 	body += `<h1>内网入口</h1><p class="sub">输入账号密码后继续</p>` +
 		`<input name="u" placeholder="账号" autocomplete="username" autocapitalize="off">` +
@@ -851,6 +888,12 @@ func (g *Gateway) portal(w http.ResponseWriter, r *http.Request) {
 	b.WriteString(`<a class="card" href="/__passwd"><div class="row">`)
 	b.WriteString(`<div class="ico">K</div><div><div class="nm">修改密码</div>`)
 	b.WriteString(`<div class="nt">当前账号 ` + html.EscapeString(g.cfg.User) + `</div></div></div></a>`)
+
+	// 退出登录。Cookie 放在父域的 Domain 上，全站共用一张票，
+	// 所以在这里退出等于把各资产子域一起退掉，不用逐个去点。
+	b.WriteString(`<a class="card quit" href="/__logout"><div class="row">`)
+	b.WriteString(`<div class="ico">←</div><div><div class="nm">退出登录</div>`)
+	b.WriteString(`<div class="nt">清除本机登录状态，下次需重新输入密码</div></div></div></a>`)
 
 	// 唤醒交互只在页面上确实有按钮时才注入，没配 WOL 的网关
 	// （或一台都没填 mac）连这段 JS 都不需要下载
