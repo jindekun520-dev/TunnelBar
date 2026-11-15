@@ -711,8 +711,10 @@ h1{font-size:20px;margin:0 0 4px;font-weight:600}
 .tx{min-width:0}
 .ico{width:40px;height:40px;flex:0 0 40px;border-radius:10px;background:#e8f0fb;color:#185fa5;
      display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:600}
-.nm{font-size:17px;font-weight:500}
-.nt{color:#888;font-size:13px;margin-top:2px}
+/* 名字可能是 Home_Windows_1.203 这种没有空格的长串，窄屏上要允许断行，
+   否则整张卡片会被撑出屏幕，右边的「唤醒」按钮跟着跑出去 */
+.nm{font-size:17px;font-weight:500;overflow-wrap:break-word;word-wrap:break-word}
+.nt{color:#888;font-size:13px;margin-top:2px;overflow-wrap:break-word;word-wrap:break-word}
 /* 唤醒按钮：尺寸必须压过下面那条通用 button 规则（登录按钮要整宽，这个不要） */
 .wk{width:auto;flex:0 0 auto;padding:9px 14px;font-size:14px;font-weight:500;color:#fff;
     background:#185fa5;border:0;border-radius:8px}
