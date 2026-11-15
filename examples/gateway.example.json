@@ -18,7 +18,8 @@
       "target": "10.0.0.10:443",
       "scheme": "https",
       "icon": "▣",
-      "note": "虚拟化 · 10.0.0.10"
+      "note": "虚拟化 · 10.0.0.10",
+      "mac": "aa:bb:cc:dd:ee:ff"
     },
     {
       "sub": "nas",
@@ -35,6 +36,13 @@
       "scheme": "https",
       "icon": "◇",
       "note": "网关设备"
+    },
+    {
+      "name": "Windows 工作站",
+      "target": "10.0.0.23:3389",
+      "scheme": "http",
+      "note": "10.0.0.23 · 关机时用「唤醒」叫起来",
+      "mac": "11:22:33:44:55:66"
     }
   ],
   "paths": {
@@ -46,5 +54,12 @@
     "target": "http://127.0.0.1:8089",
     "user": "gcuser",
     "password": "换成 user-mapping.xml 里的账号密码"
+  },
+  "wol": {
+    "endpoint": "127.0.0.1:9912",
+    "token": "",
+    "port": 9,
+    "broadcast": [],
+    "wait_seconds": 90
   }
 }

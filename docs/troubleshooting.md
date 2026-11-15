@@ -126,6 +126,31 @@ ifconfig utunN                # 有没有 198.18.0.1 这个地址
 
 `route add` 退出码为 0 但内核拒绝是常见现象（接口没配 IPv4 时）。两个都要核对。
 
+## 唤醒按了没反应（WoL）
+
+先分清「包没发出去」还是「发出去但没醒」：
+
+```bash
+# 1) home 侧真的发出去了吗（有这行说明包已经进了内网广播域）
+journalctl -u tunnel-home | grep 唤醒包
+
+# 2) 菜单栏 App 两条路各自的结论（不用点菜单）
+/Applications/TunnelBar.app/Contents/MacOS/TunnelBar --woltest AA:BB:CC:DD:EE:FF
+
+# 3) 网关转发给谁（改了 endpoint 之后最容易出错的地方）
+journalctl -u carweb-gateway | grep -i wol
+```
+
+- **「连不上家里主机的唤醒接口」**：`wol.endpoint` 是**从 home 视角**看的地址，通常就是 `127.0.0.1:9912`。写成 `10.0.0.12:9912` 一般也能通（那是 home 自己的地址），但写成公网 IP 一定不通。
+- **`sent: 0` 或提示没有可用广播地址**：home 那台机器只有回环、或者网卡都没 `BROADCAST` 标志。检查 `ip -4 addr`。
+- **包发出去了但机器不醒**，按可能性从高到低查：
+  1. MAC 填错（最常见）。在**目标开机时**用 `ip neigh | grep <IP>` 或路由器 DHCP 绑定表核对。**注意**：目标关机时 ARP 表里的记录可能是别的设备（代理 ARP / 静态绑定），不能拿来当准；
+  2. BIOS/UEFI 里没开 Wake-on-LAN（有的叫 `Power On by PCIe`、`ErP` 要关掉）；
+  3. 操作系统里网卡没允许唤醒：Windows「设备管理器 → 网卡 → 电源管理 → 允许此设备唤醒计算机」，Linux `ethtool -s eth0 wol g`（**很多网卡断电后不保留这个设置**）；
+  4. 交换机/路由器丢弃广播，或目标接在 Wi-Fi 上（无线唤醒多数不支持）；
+  5. 端口不对：老网卡只认 7，把 `wol.port` / `wolPort` 改成 7 试试。
+- **门户显示「已上线」但打不开**：`check` 探的是 TCP 端口，可能探到了别的服务。显式给资产填 `check` 指到真正的服务端口。
+
 ## ping 通但 TCP 不通 / 反向
 
 - ping 通 TCP 不通：目标主机的防火墙只放了 ICMP；

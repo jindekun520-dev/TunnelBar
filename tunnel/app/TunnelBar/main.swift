@@ -73,6 +73,16 @@ struct Asset: Codable {
     var localPort: Int?
     var note: String = ""
     var enabled: Bool = true
+    /// 网络唤醒用的 MAC（AA:BB:CC:DD:EE:FF / aa-bb-... / 裸 12 位都认）。
+    ///
+    /// 这里必须是 Optional，不能用「非可选 + 默认空串」：合成的解码器对
+    /// 非可选属性要求 JSON 里**必须有这个键**，老配置文件就会整份解码失败，
+    /// Config.load() 会退回默认配置并写盘——用户的资产全没了。
+    var mac: String?
+
+    /// 去掉空白后的 MAC；没配就是空串
+    var macText: String { (mac ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
+    var canWake: Bool { !macText.isEmpty }
 
     /// 派生成 client 的 -forward 规则；直连资产返回 nil
     var forwardRule: String? {
@@ -207,6 +217,16 @@ struct Config: Codable {
     /// TUN 接口 MTU，隧道再套一层 TCP，留出余量避免二次分片
     var tunMTU: Int = 1400
 
+    // 网络唤醒（Wake-on-LAN）
+    /// 魔术包 UDP 端口。9 最常见；少数老网卡只认 7
+    var wolPort: Int = 9
+    /// 指定广播地址（如 10.0.0.255）。留空 = 按本机每块网卡自动算，推荐留空
+    var wolBroadcast: [String] = []
+    /// 经隧道让家里主机代发时，home 端 WOL 接口的地址（home 视角，通常是回环）
+    var wolEndpoint: String = "127.0.0.1:9912"
+    /// 是否同时走隧道。本机不在内网时这是唯一能真正唤醒的路径
+    var wolViaTunnel: Bool = true
+
     // 本机自测模式使用的端口，避开生产端口以免互相干扰
     var labRelayHome: Int = 17000
     var labRelayClient: Int = 17100
@@ -255,6 +275,10 @@ struct Config: Codable {
         tunEnabled = try c.decodeIfPresent(Bool.self, forKey: .tunEnabled) ?? d.tunEnabled
         tunRoutes = try c.decodeIfPresent([String].self, forKey: .tunRoutes) ?? d.tunRoutes
         tunMTU = try c.decodeIfPresent(Int.self, forKey: .tunMTU) ?? d.tunMTU
+        wolPort = try c.decodeIfPresent(Int.self, forKey: .wolPort) ?? d.wolPort
+        wolBroadcast = try c.decodeIfPresent([String].self, forKey: .wolBroadcast) ?? d.wolBroadcast
+        wolEndpoint = try c.decodeIfPresent(String.self, forKey: .wolEndpoint) ?? d.wolEndpoint
+        wolViaTunnel = try c.decodeIfPresent(Bool.self, forKey: .wolViaTunnel) ?? d.wolViaTunnel
         labRelayHome = try c.decodeIfPresent(Int.self, forKey: .labRelayHome) ?? d.labRelayHome
         labRelayClient = try c.decodeIfPresent(Int.self, forKey: .labRelayClient) ?? d.labRelayClient
         labSocksPort = try c.decodeIfPresent(Int.self, forKey: .labSocksPort) ?? d.labSocksPort
@@ -671,6 +695,147 @@ func fetchStatus(port: Int, timeout: TimeInterval = 1.2) -> ClientStatus? {
     return result
 }
 
+// MARK: - 网络唤醒（Wake-on-LAN）
+//
+// 两条路同时走，谁也不挡谁：
+//   1. 本机 UDP 广播——人在家里、Mac 就在同一网段时，直接就唤醒了；
+//   2. 经隧道让家里主机代发——人在外面时，本机广播只是发到当前网络（
+//      多半是酒店 WiFi），只有这条才真正落到家里的广播域。
+// 两条都发没有副作用：魔术包是幂等的，重复发不会把机器搞乱。
+
+enum WOL {
+    /// 魔术包：6 字节 FF + MAC 重复 16 次，共 102 字节
+    static let packetLen = 102
+
+    /// 解析 MAC，写法太杂（设备页面多是裸 12 位、`ip link` 带冒号、
+    /// Windows 的 getmac 带横杠），这里全认。
+    static func parseMAC(_ s: String) -> [UInt8]? {
+        let cleaned = s.filter { $0 != ":" && $0 != "-" && $0 != "." && $0 != " " && $0 != "\t" }
+        guard cleaned.count == 12 else { return nil }
+        var out: [UInt8] = []
+        var idx = cleaned.startIndex
+        for _ in 0..<6 {
+            let next = cleaned.index(idx, offsetBy: 2)
+            guard let b = UInt8(cleaned[idx..<next], radix: 16) else { return nil }
+            out.append(b)
+            idx = next
+        }
+        if out.allSatisfy({ $0 == 0 }) { return nil }   // 全 0 不是有效目标
+        if out[0] & 0x01 != 0 { return nil }           // 组播/广播地址
+        return out
+    }
+
+    static func macString(_ b: [UInt8]) -> String {
+        b.map { String(format: "%02x", $0) }.joined(separator: ":")
+    }
+
+    static func packet(_ mac: [UInt8]) -> [UInt8] {
+        var p = [UInt8](repeating: 0xFF, count: 6)
+        for _ in 0..<16 { p.append(contentsOf: mac) }
+        return p
+    }
+
+    /// 本机各网卡的定向广播地址（10.0.0.1/24 → 10.0.0.255）。
+    /// 只发 255.255.255.255 在多网卡（含 VPN、虚拟网卡）的 Mac 上经常从
+    /// 错的接口出去，包压根到不了目标网段。
+    static func localBroadcasts() -> [String] {
+        var out: [String] = []
+        var ifap: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifap) == 0, let first = ifap else { return out }
+        defer { freeifaddrs(ifap) }
+
+        var cur: UnsafeMutablePointer<ifaddrs>? = first
+        while let p = cur {
+            cur = p.pointee.ifa_next
+            let flags = Int32(p.pointee.ifa_flags)
+            guard (flags & IFF_UP) != 0, (flags & IFF_LOOPBACK) == 0, (flags & IFF_BROADCAST) != 0 else { continue }
+            guard let sa = p.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) else { continue }
+            guard let ms = p.pointee.ifa_netmask, ms.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+            let ip = UInt32(bigEndian: sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr })
+            let mask = UInt32(bigEndian: ms.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr })
+            let b = ip | ~mask
+            let str = "\((b >> 24) & 0xff).\((b >> 16) & 0xff).\((b >> 8) & 0xff).\(b & 0xff)"
+            if str != "255.255.255.255" && !out.contains(str) { out.append(str) }
+        }
+        return out
+    }
+
+    /// 往每个广播地址各发一个魔术包。多网卡机器上某块网卡发不出去很正常
+    /// （例如没插网线的 USB 网卡），只要有一份成功就算成功。
+    static func send(_ mac: [UInt8], hosts: [String], port: Int) -> (sent: Int, used: [String], errors: [String]) {
+        let pkt = packet(mac)
+        var sent = 0
+        var used: [String] = []
+        var errors: [String] = []
+        for host in hosts {
+            let fd = socket(AF_INET, SOCK_DGRAM, 0)
+            if fd < 0 { errors.append("\(host)：建 socket 失败"); continue }
+            var yes: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = in_port_t(UInt16(port).bigEndian)
+            addr.sin_addr.s_addr = inet_addr(host)
+
+            let n = pkt.withUnsafeBytes { raw -> Int in
+                withUnsafePointer(to: &addr) { ap -> Int in
+                    ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        sendto(fd, raw.baseAddress, pkt.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
+            close(fd)
+            if n == pkt.count {
+                sent += 1
+                if !used.contains(host) { used.append(host) }
+            } else {
+                errors.append("\(host)：sendto 返回 \(n)")
+            }
+        }
+        return (sent, used, errors)
+    }
+
+    /// 经隧道请家里主机代发。返回 nil 表示成功，否则是给人看的错误原因。
+    static func wakeViaTunnel(endpoint: String, socksPort: Int, mac: [UInt8], port: Int) -> String? {
+        let parts = endpoint.split(separator: ":")
+        guard parts.count >= 2, let eport = UInt16(parts[1]) else {
+            return "接口地址写法不对（应形如 127.0.0.1:9912）"
+        }
+        guard let fd = socksConnect(socksPort: socksPort, host: String(parts[0]), port: eport, timeout: 8) else {
+            return "隧道没通（client 的 SOCKS \(socksPort) 没起来？）"
+        }
+        defer { close(fd) }
+
+        let body = "{\"mac\":\"\(macString(mac))\",\"port\":\(port)}"
+        let req = "POST /wake HTTP/1.1\r\n"
+            + "Host: \(endpoint)\r\n"
+            + "Content-Type: application/json\r\n"
+            + "Content-Length: \(body.utf8.count)\r\n"
+            + "Connection: close\r\n\r\n"
+            + body
+        guard writeAll(fd, Array(req.utf8)) else { return "请求写不出去，隧道可能断了" }
+
+        var got: [UInt8] = []
+        var buf = [UInt8](repeating: 0, count: 1024)
+        var guard_ = 0
+        while got.count < 8192 && guard_ < 16 {
+            let n = read(fd, &buf, buf.count)
+            if n <= 0 { break }
+            got.append(contentsOf: buf[0..<n])
+            guard_ += 1
+        }
+        let text = String(decoding: got, as: UTF8.self)
+        guard let first = text.split(separator: "\r\n").first else { return "没有收到应答" }
+        if !first.contains(" 200 ") {
+            return "家里主机回了 " + first.replacingOccurrences(of: "HTTP/1.1 ", with: "")
+                + (text.contains("error") ? "（\(text.suffix(120))）" : "")
+        }
+        return nil
+    }
+}
+
 // MARK: - 端口/连通性工具
 
 func isPortOpen(_ port: Int, host: String = "127.0.0.1") -> Bool {
@@ -690,17 +855,15 @@ func isPortOpen(_ port: Int, host: String = "127.0.0.1") -> Bool {
 }
 
 /// 走 SOCKS5 建连到 target，返回耗时（毫秒）；失败返回 nil。
-func socksProbe(socksPort: Int, target: String, timeout: TimeInterval = 5) -> Double? {
-    let parts = target.split(separator: ":")
-    guard parts.count == 2, let tport = UInt16(parts[1]) else { return nil }
-    let host = String(parts[0])
+/// 走本机 SOCKS5 建一条到 host:port 的 TCP 连接，返回已连好的 fd（调用方负责 close）。
+///
+/// 单独抽出来是因为「探测延迟」和「经隧道发唤醒请求」都要这一段握手，
+/// 复制两份的话迟早会有一份忘记处理域名长度上限或者应答变长。
+func socksConnect(socksPort: Int, host: String, port: UInt16, timeout: TimeInterval = 5) -> Int32? {
     guard let hostBytes = host.data(using: .utf8), hostBytes.count <= 255 else { return nil }
-
-    let start = Date()
 
     let fd = socket(AF_INET, SOCK_STREAM, 0)
     if fd < 0 { return nil }
-    defer { close(fd) }
 
     var addr = sockaddr_in()
     addr.sin_family = sa_family_t(AF_INET)
@@ -716,32 +879,42 @@ func socksProbe(socksPort: Int, target: String, timeout: TimeInterval = 5) -> Do
             connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
     }
-    guard rc == 0 else { return nil }
+    guard rc == 0 else { close(fd); return nil }
 
     // 握手：版本 5，1 种方法，无认证
-    guard writeAll(fd, [0x05, 0x01, 0x00]) else { return nil }
-    guard let hello = readExact(fd, 2), hello[0] == 0x05, hello[1] == 0x00 else { return nil }
+    guard writeAll(fd, [0x05, 0x01, 0x00]) else { close(fd); return nil }
+    guard let hello = readExact(fd, 2), hello[0] == 0x05, hello[1] == 0x00 else { close(fd); return nil }
 
     // CONNECT，域名类型（IP 字面量也能被对端正常解析）
     var req: [UInt8] = [0x05, 0x01, 0x00, 0x03, UInt8(hostBytes.count)]
     req.append(contentsOf: hostBytes)
-    req.append(UInt8(tport >> 8))
-    req.append(UInt8(tport & 0xff))
-    guard writeAll(fd, req) else { return nil }
+    req.append(UInt8(port >> 8))
+    req.append(UInt8(port & 0xff))
+    guard writeAll(fd, req) else { close(fd); return nil }
 
-    guard let head = readExact(fd, 4), head[0] == 0x05, head[1] == 0x00 else { return nil }
+    guard let head = readExact(fd, 4), head[0] == 0x05, head[1] == 0x00 else { close(fd); return nil }
     switch head[3] {
     case 0x01:
-        _ = readExact(fd, 4 + 2)
+        guard readExact(fd, 4 + 2) != nil else { close(fd); return nil }
     case 0x04:
-        _ = readExact(fd, 16 + 2)
+        guard readExact(fd, 16 + 2) != nil else { close(fd); return nil }
     case 0x03:
-        if let l = readExact(fd, 1), let first = l.first {
-            _ = readExact(fd, Int(first) + 2)
-        }
+        guard let l = readExact(fd, 1), let first = l.first else { close(fd); return nil }
+        guard readExact(fd, Int(first) + 2) != nil else { close(fd); return nil }
     default:
+        close(fd); return nil
+    }
+    return fd
+}
+
+func socksProbe(socksPort: Int, target: String, timeout: TimeInterval = 5) -> Double? {
+    let parts = target.split(separator: ":")
+    guard parts.count == 2, let tport = UInt16(parts[1]) else { return nil }
+    let start = Date()
+    guard let fd = socksConnect(socksPort: socksPort, host: String(parts[0]), port: tport, timeout: timeout) else {
         return nil
     }
+    close(fd)
     return Date().timeIntervalSince(start) * 1000
 }
 
@@ -1421,6 +1594,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sub.addItem(rmRoot)
         }
 
+        // 只列出配了 MAC 的资产；一台都没配就整块不显示，免得菜单里多一行空的
+        let wakeIdxes = list.enumerated().filter { $0.element.canWake }.map { $0.offset }
+        if !wakeIdxes.isEmpty {
+            let wakeRoot = NSMenuItem(title: "唤醒设备", action: nil, keyEquivalent: "")
+            wakeRoot.image = menuIcon("power")
+            let ws = NSMenu()
+            for idx in wakeIdxes {
+                let a = list[idx]
+                let it = NSMenuItem(title: a.name, action: #selector(wakeAsset), keyEquivalent: "")
+                it.target = self
+                it.tag = idx
+                it.toolTip = "向 \(a.macText) 广播魔术包（端口 \(cfg.wolPort)）"
+                it.image = menuIcon("power")
+                ws.addItem(it)
+            }
+            ws.addItem(.separator())
+            let all = NSMenuItem(title: "唤醒全部（\(wakeIdxes.count) 台）", action: #selector(wakeAll), keyEquivalent: "")
+            all.target = self
+            ws.addItem(all)
+            wakeRoot.submenu = ws
+            sub.addItem(wakeRoot)
+        }
+
         let openCustom = NSMenuItem(title: "在浏览器打开地址…", action: #selector(openCustomURL), keyEquivalent: "")
         openCustom.target = self
         openCustom.image = menuIcon("link")
@@ -1692,25 +1888,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.informativeText = lines.joined(separator: "\n")
 
         alert.addButton(withTitle: openButtonTitle(a.scheme))
+        // 配了 MAC 才插「唤醒」；按钮顺序一变，下标就得跟着算，不能写死 case
+        let wakeIdx: Int? = a.canWake ? 1 : nil
+        if a.canWake { alert.addButton(withTitle: "唤醒") }
         alert.addButton(withTitle: "编辑…")
         let copyUser = alert.addButton(withTitle: "复制账号")
         let copyPass = alert.addButton(withTitle: "复制密码")
         copyUser.isEnabled = !a.user.isEmpty
         copyPass.isEnabled = hasPass
 
+        let editIdx = a.canWake ? 2 : 1
         // NSAlert 第 4 个按钮以后没有命名常量，只能按 rawValue 判断（1000 起）
-        switch alert.runModal().rawValue {
-        case 1000:
+        let chosen = Int(alert.runModal().rawValue) - 1000
+        switch chosen {
+        case 0:
             openAssetNow(a)
-        case 1001:
+        case editIdx:
             editAssetDialog(a)
-        case 1002:
+        case editIdx + 1:
             copyToClipboard(a.user, what: "账号")
-        case 1003:
+        case editIdx + 2:
             if let pw = assetPassword(a) { copyToClipboard(pw, what: "密码") }
         default:
-            break
+            if let w = wakeIdx, chosen == w { wakeNow(a) }
         }
+    }
+
+    /// 菜单「唤醒设备」里的入口（tag 对应 cfg.assets 过滤后的下标）
+    @objc private func wakeAsset(_ sender: NSMenuItem) {
+        let list = cfg.assets.filter { $0.enabled }
+        guard sender.tag >= 0, sender.tag < list.count else { return }
+        wakeNow(list[sender.tag])
+    }
+
+    /// 一次把配了 MAC 的设备都唤醒（比如开机前把 NAS + Windows 一起叫起来）
+    @objc private func wakeAll() {
+        let targets = cfg.assets.filter { $0.enabled && $0.canWake }
+        guard !targets.isEmpty else { return }
+        var lines: [String] = []
+        for a in targets {
+            guard let macBytes = WOL.parseMAC(a.macText) else {
+                lines.append("\(a.name)：MAC 不对（\(a.macText)），跳过")
+                continue
+            }
+            var paths: [String] = []
+            let hosts = cfg.wolBroadcast.isEmpty ? WOL.localBroadcasts() : cfg.wolBroadcast
+            let local = WOL.send(macBytes, hosts: hosts, port: cfg.wolPort)
+            if local.sent > 0 { paths.append("本机 \(local.sent) 包") }
+            if cfg.wolViaTunnel {
+                if let err = WOL.wakeViaTunnel(endpoint: cfg.wolEndpoint, socksPort: cfg.socksPort,
+                                               mac: macBytes, port: cfg.wolPort) {
+                    paths.append("隧道失败：\(err)")
+                } else {
+                    paths.append("隧道已代发")
+                }
+            }
+            lines.append("\(a.name)：" + paths.joined(separator: " / "))
+        }
+        appLog("唤醒全部：" + lines.joined(separator: "；"))
+        alert("唤醒全部（\(targets.count) 台）", lines.joined(separator: "\n") + "\n\n等 30–90 秒再逐个打开。")
+    }
+
+    /// 唤醒一台设备：本机广播 + 经隧道代发，两条路都试，最后如实报告结果。
+    private func wakeNow(_ a: Asset) {
+        guard let macBytes = WOL.parseMAC(a.macText) else {
+            alertError("唤醒失败", "「\(a.name)」的 MAC 填得不对：\(a.macText.isEmpty ? "（空）" : a.macText)\n\n"
+                      + "应形如 AA:BB:CC:DD:EE:FF，也认 aa-bb-cc-dd-ee-ff 和裸 12 位十六进制。")
+            return
+        }
+
+        var lines: [String] = []
+        var ok = false
+
+        // ① 本机广播：人在家里时这条就够
+        let hosts = cfg.wolBroadcast.isEmpty ? WOL.localBroadcasts() : cfg.wolBroadcast
+        let local = WOL.send(macBytes, hosts: hosts, port: cfg.wolPort)
+        if local.sent > 0 {
+            ok = true
+            lines.append("本机广播：已发出 \(local.sent) 个包 → " + local.used.joined(separator: "、"))
+        } else {
+            lines.append("本机广播：没发出去（" + (local.errors.first ?? "找不到可广播的网卡") + "）")
+        }
+
+        // ② 经隧道让家里主机代发：人在外面时这条才有效
+        if cfg.wolViaTunnel {
+            if let err = WOL.wakeViaTunnel(endpoint: cfg.wolEndpoint, socksPort: cfg.socksPort,
+                                           mac: macBytes, port: cfg.wolPort) {
+                lines.append("经隧道：\(err)")
+            } else {
+                ok = true
+                lines.append("经隧道：家里主机已代发（\(cfg.wolEndpoint)）")
+            }
+        }
+
+        appLog("唤醒 \(a.name)（\(WOL.macString(macBytes))）：" + lines.joined(separator: "；"))
+        alert(ok ? "已发送唤醒包 · \(a.name)" : "唤醒包没发出去 · \(a.name)",
+              lines.joined(separator: "\n")
+              + "\n\n开机到能连上一般要 30–90 秒。等一会儿再点「\(openButtonTitle(a.scheme))」。")
     }
 
     private func openButtonTitle(_ scheme: String) -> String {
@@ -1778,6 +2052,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var user = ""
         var localPort = ""
         var note = ""
+        var mac = ""
         var password = ""
         var clearPassword = false
         var hasPassword = false
@@ -1794,6 +2069,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         info += "\n\n本地转发端口留空就是直连（走 TUN 或 SOCKS，不占本地端口）；"
         info += "只有浏览器这类不认代理的程序才需要填一个本地端口。"
         info += "\n账号和密码只在「协议 = ssh」时用于一键登录，密码存系统钥匙串。"
+        info += "\nMAC 可选：填了这台资产就能在菜单里被「网络唤醒」，关机状态也能叫起来。"
         if let e = draft.error { info = "⚠︎ \(e)\n\n" + info }
         alert.informativeText = info
         alert.addButton(withTitle: okTitle)
@@ -1850,9 +2126,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         noteField.placeholderString = "备注，可留空"
         noteField.stringValue = draft.note
 
+        // MAC 放最后一行：留空的资产就只是一个普通入口，不影响原有用法
+        let macCaption = caption("MAC", 0, 8, 48)
+        let macField = NSTextField(frame: NSRect(x: 56, y: 4, width: 150, height: 24))
+        macField.placeholderString = "AA:BB:CC:DD:EE:FF"
+        macField.stringValue = draft.mac
+        let macHint = caption("填了就能网络唤醒（关机状态也能开机）", 214, 8, 250)
+
         for v in [nameCaption, nameField, hostCaption, hostField, portField, schemePopup,
                   userCaption, userField, passCaption, passField, clearBox,
-                  localCaption, localField, localHint, noteCaption, noteField] {
+                  localCaption, localField, localHint, noteCaption, noteField,
+                  macCaption, macField, macHint] {
             box.addSubview(v)
         }
         alert.accessoryView = box
@@ -1867,6 +2151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             user: userField.stringValue,
             localPort: localField.stringValue,
             note: noteField.stringValue,
+            mac: macField.stringValue,
             password: passField.stringValue,
             clearPassword: clearBox.state == .on,
             hasPassword: draft.hasPassword,
@@ -1899,6 +2184,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lp = v
         }
 
+        // MAC 可以留空；填了就必须能解析，并统一成 aa:bb:cc:dd:ee:ff 再存
+        var macOut: String?
+        let macRaw = d.mac.trimmingCharacters(in: .whitespaces)
+        if !macRaw.isEmpty {
+            guard let b = WOL.parseMAC(macRaw) else {
+                return ("MAC 写法不对：「\(macRaw)」，应形如 AA:BB:CC:DD:EE:FF", nil)
+            }
+            macOut = WOL.macString(b)
+        }
+
         let name = d.name.trimmingCharacters(in: .whitespaces)
         var a = Asset(
             name: name.isEmpty ? "\(host):\(port)" : name,
@@ -1907,6 +2202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             localPort: lp,
             note: d.note.trimmingCharacters(in: .whitespaces)
         )
+        a.mac = macOut
         if let id = editingID { a.id = id }
         return (nil, a)
     }
@@ -1948,7 +2244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var draft = AssetDraft(
             name: a.name, host: a.host, port: "\(a.port)", scheme: a.scheme,
             user: a.user, localPort: a.localPort.map(String.init) ?? "",
-            note: a.note, hasPassword: hasPass
+            note: a.note, mac: a.macText, hasPassword: hasPass
         )
         let oldLocal = a.localPort
 
@@ -2951,6 +3247,57 @@ enum SelfTest {
         guard parts.count == 2 else { return nil }
         return (String(parts[0]), String(parts[1]))
     }
+}
+
+/// 无界面唤醒自检：`TunnelBar --woltest AA:BB:CC:DD:EE:FF`
+///
+/// 菜单里点一次才知道结果太慢，出问题时也不方便看细节。这个入口把
+/// 「解析 → 算广播地址 → 发本机 → 发隧道」每一步都打出来，给排查用。
+func wolTest(_ macArg: String) -> Never {
+    let cfg = Config.load()
+    print("▸ 唤醒自检")
+    print("  MAC 入参：\(macArg)")
+
+    guard let mac = WOL.parseMAC(macArg) else {
+        print("✗ MAC 解析失败（应形如 AA:BB:CC:DD:EE:FF，也认 aa-bb-… 与裸 12 位）")
+        exit(2)
+    }
+    // 包结构自查：NIC 是按比特比对的，长度对但内容错一样唤不醒
+    let pkt = WOL.packet(mac)
+    let head6 = pkt.prefix(6).allSatisfy { $0 == 0xFF }
+    var repeatsOK = true
+    for i in 0..<16 where pkt[(6 + i * 6)..<(12 + i * 6)] != mac[...] { repeatsOK = false }
+    if pkt.count == 102 && head6 && repeatsOK {
+        print("  MAC 规范化为：\(WOL.macString(mac))，魔术包 102 字节 · 结构校验通过")
+    } else {
+        print("✗ 魔术包结构不对：长度 \(pkt.count)（应 102），同步头 \(head6)，MAC 重复 \(repeatsOK)")
+        exit(3)
+    }
+
+    let hosts = cfg.wolBroadcast.isEmpty ? WOL.localBroadcasts() : cfg.wolBroadcast
+    print("  本机广播地址：\(hosts.isEmpty ? "（无）" : hosts.joined(separator: "、"))")
+    print("  UDP 端口：\(cfg.wolPort)")
+
+    let local = WOL.send(mac, hosts: hosts, port: cfg.wolPort)
+    print("  本机广播：发出 \(local.sent) 个" + (local.errors.isEmpty ? "" : "；错误：\(local.errors.joined(separator: " / "))"))
+
+    if cfg.wolViaTunnel {
+        if let err = WOL.wakeViaTunnel(endpoint: cfg.wolEndpoint, socksPort: cfg.socksPort,
+                                       mac: mac, port: cfg.wolPort) {
+            print("  经隧道（\(cfg.wolEndpoint)）：失败 —— \(err)")
+        } else {
+            print("  经隧道（\(cfg.wolEndpoint)）：家里主机已代发")
+        }
+    } else {
+        print("  经隧道：配置里 wolViaTunnel=false，跳过")
+    }
+
+    exit(local.sent > 0 ? 0 : 1)
+}
+
+if let i = CommandLine.arguments.firstIndex(of: "--woltest") {
+    let mac = i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : ""
+    wolTest(mac)
 }
 
 if CommandLine.arguments.contains("--selftest") {

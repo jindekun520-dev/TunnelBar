@@ -111,6 +111,7 @@
 | 浏览器远程桌面 | Web 端 SSH 终端 + Windows RDP，网关代登录，不用二次输密码 | `gateway` + Guacamole |
 | 登录门 | HMAC Cookie（14 天）+ PBKDF2 密码哈希 + 在线改密 + 改密即全端失效 | `gateway` |
 | 证书热加载 | 按 mtime 自动重读，`certbot renew` 后不用重启 | `gateway` |
+| 网络唤醒（WoL） | 关机设备一点就醒：由 home 在内网广播魔术包，浏览器门户和菜单栏都能触发，并自动等到目标上线 | `gateway` + `home` + `TunnelBar.app` |
 | 状态可观测 | client / relay 都暴露 JSON 状态端点，池内每条连接的 RTT、流量、重传一目了然 | `client` `relay` |
 | 自检与测试 | 协议层单测 + 本机全链路 e2e（含 20MB 完整性校验）+ App 内一键自测 | 全部 |
 
@@ -151,7 +152,10 @@ Guacamole 自带用户体系，正常要再登一次。网关的做法是：抓�
 **11. 菜单栏 App 零第三方依赖**
 纯 AppKit + `swiftc` 手写构建，没有 SwiftPM、没有 Electron、没有 100MB 运行时。图标走 SF Symbols 模板图，颜色随深浅色菜单栏自动反转；状态靠**形状**区分（盾牌 / 对勾 / 感叹号 / 斜线）。
 
-**12. 可观测性做在文件系统里的 JSON 上**
+**12. 唤醒关机设备，关键在「谁在内网」**
+魔术包是**链路层广播**，公网服务器发往 `10.0.0.255` 只会被路由丢掉（定向广播默认关闭），也跨不过 NAT。所以唤醒请求的终点不是网关，而是**家里那台 `home`**：网关经 SOCKS 把请求转给它，由它按本机每块网卡算出定向广播地址再发。Web 门户与菜单栏两个入口共用这套逻辑，各按钮都同时尝试「本机直发」和「隧道代发」——人在家里前者就够，人在外面只有后者有效。按下去之后门户会盯着目标端口轮询，**真的起来了才说「已上线」**，否则用户只会反复点。
+
+**13. 可观测性做在文件系统里的 JSON 上**
 `curl 127.0.0.1:9908/status` 直接拿到池内每条连接的 `rtt_ms / idle_ms / resets / stalled / tx_bytes`。不需要 Prometheus，也不妨碍你自己接监控。
 
 ---
@@ -223,6 +227,10 @@ ssh root@10.0.0.12 'chmod +x /usr/local/bin/tunnel-home
   systemctl daemon-reload && systemctl enable --now tunnel-home'
 ```
 
+`home` 默认会在 `127.0.0.1:9912` 起一个唤醒接口（`-wol-addr` 可改、留空则关闭），
+供网关和菜单栏 App 经隧道调用来发魔术包——详见 [Web 端](#web-端给只有浏览器的设备) 与
+[docs/macos-app.md](docs/macos-app.md)。
+
 ### 第 3 步：本机（client）
 
 ```bash
@@ -267,11 +275,15 @@ ssh -o ProxyCommand="nc -x 127.0.0.1:1080 %h %p" root@10.0.0.12
   "tls_cert": "/etc/letsencrypt/live/example.com/fullchain.pem",
   "tls_key": "/etc/letsencrypt/live/example.com/privkey.pem",
   "assets": [
-    { "sub": "esxi", "name": "ESXi 宿主机", "target": "10.0.0.10:443", "scheme": "https", "icon": "▣", "note": "虚拟化" },
-    { "sub": "nas",  "name": "NAS 管理",   "target": "10.0.0.11:5001", "scheme": "https", "icon": "▤" }
+    { "sub": "esxi", "name": "ESXi 宿主机", "target": "10.0.0.10:443", "scheme": "https", "icon": "▣", "note": "虚拟化",
+      "mac": "c4:83:4f:18:02:1b" },
+    { "sub": "nas",  "name": "NAS 管理",   "target": "10.0.0.11:5001", "scheme": "https", "icon": "▤" },
+    { "name": "Windows 工作站", "target": "10.0.0.23:3389", "note": "开机后才连得上",
+      "mac": "00:1a:2b:3c:4d:5e" }
   ],
   "paths": { "/guacamole/": "http://127.0.0.1:8089" },
-  "guacamole": { "path": "/guacamole/", "target": "http://127.0.0.1:8089", "user": "gcuser", "password": "gcpass" }
+  "guacamole": { "path": "/guacamole/", "target": "http://127.0.0.1:8089", "user": "gcuser", "password": "gcpass" },
+  "wol": { "endpoint": "127.0.0.1:9912", "token": "", "port": 9, "wait_seconds": 90 }
 }
 ```
 
@@ -281,6 +293,22 @@ ssh -o ProxyCommand="nc -x 127.0.0.1:1080 %h %p" root@10.0.0.12
 - 只有 1 个端口需要映射，新增资产只加一条 `assets`；
 - `/__health` 无需登录，方便探活；
 - 密码在门户最下面一行可以直接改（`/__passwd`），改完整网所有旧 Cookie 立即失效。
+
+### 关机设备也能一点就醒
+
+给资产填上 `mac`，门户上那张卡片右边就多一个「唤醒」按钮；只填 `mac` 不填 `sub`/`port` 的资产就是一台「纯唤醒设备」（比如只在你开机之后才连得上的 Windows 工作站）：
+
+```json
+"wol": { "endpoint": "127.0.0.1:9912", "token": "", "port": 9, "wait_seconds": 90 }
+```
+
+请求的走向跟网页访问**不同**：网关不在内网，魔术包必须由家里的 `home` 发。
+
+```
+浏览器 --POST /__wake--> gateway --SOCKS--> client --> relay --> home --UDP 广播--> 目标网卡
+```
+
+`home` 端默认就带这个接口（`-wol-addr 127.0.0.1:9912`，只听回环，所以局域网里其他机器连不上），网关的 `wol.endpoint` 填的就是**从 home 视角看的地址**。点下去之后门户会每 3 秒探一次目标端口，真的通了才显示「已上线」，超时（默认 90 秒）会说清楚没等到。
 
 ---
 
@@ -317,8 +345,8 @@ tunnelbar/
 | [docs/architecture.md](docs/architecture.md) | 协议、帧格式、密钥派生、复用层与 v1→v2 的修复清单 |
 | [docs/deploy.md](docs/deploy.md) | 三端 + 网关的部署、systemd、看门狗、升级顺序 |
 | [docs/client.md](docs/client.md) | client 全部参数、TUN 模式、连接池读数、状态接口字段 |
-| [docs/gateway.md](docs/gateway.md) | Web 网关配置、子域/端口两种模式、密码体系、Guacamole 接入 |
-| [docs/macos-app.md](docs/macos-app.md) | 菜单栏 App 用法、资产模型、配置项、图标与打包 |
+| [docs/gateway.md](docs/gateway.md) | Web 网关配置、子域/端口两种模式、密码体系、Guacamole 接入、网络唤醒 |
+| [docs/macos-app.md](docs/macos-app.md) | 菜单栏 App 用法、资产模型、网络唤醒、配置项、图标与打包 |
 | [docs/performance.md](docs/performance.md) | 从 340KB/s 到 1.67MB/s 的调优记录与实测数据 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 按现象排查：连不上 / 慢 / 登录进不去 / 证书 / 端口占用 |
 | [docs/security.md](docs/security.md) | 威胁模型、PSK 管理、公网暴露面、加固清单 |

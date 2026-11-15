@@ -30,6 +30,10 @@ var (
 	dialTO     time.Duration
 	lingerTO   time.Duration
 	verbose    bool
+	// WOL 接口：家里这台机器是唯一能有效发出魔术包的位置
+	wolAddr  string
+	wolToken string
+	wolPort  int
 )
 
 const (
@@ -53,6 +57,11 @@ func init() {
 	flag.DurationVar(&dialTO, "dial-timeout", 8*time.Second, "连接内网目标超时")
 	flag.DurationVar(&lingerTO, "linger", 60*time.Second, "单方向结束后等待另一方向的最长时间")
 	flag.BoolVar(&verbose, "v", false, "输出详细日志")
+	// 默认只听回环：远端经隧道访问时是 home 自己去 dial 这个地址，
+	// 所以回环就够了，同时局域网里的其他机器连不上它。
+	flag.StringVar(&wolAddr, "wol-addr", "127.0.0.1:9912", "WOL 唤醒接口监听地址（留空则关闭）")
+	flag.StringVar(&wolToken, "wol-token", "", "WOL 接口令牌，留空则不校验（仅建议配合回环监听）")
+	flag.IntVar(&wolPort, "wol-port", 9, "魔术包默认 UDP 端口（少数老网卡只认 7）")
 }
 
 // statusInfo 是写给看门狗脚本的状态快照。
@@ -404,5 +413,10 @@ func main() {
 		log.Fatal("[home] 必须通过 -key 指定预共享密钥")
 	}
 	log.Printf("[home] 启动, 中继=%s, 协议 v%d", relayAddr, internal.ProtocolVersion)
+	// 唤醒接口和隧道互不依赖：隧道断了也还能被同一局域网的机器唤醒，
+	// 所以单独一个协程，监听失败不影响主流程。
+	if wolAddr != "" {
+		go serveWOL(wolAddr, wolToken, wolPort)
+	}
 	run([]byte(homeKey))
 }

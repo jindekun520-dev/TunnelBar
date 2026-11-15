@@ -58,6 +58,12 @@ type Asset struct {
 	// 防火墙把外部端口映射成别的号时（比如外 9444 → 内 8444），
 	// 填这里，门户链接与 Location 重写才会用对外的号。留空 = 与 Port 相同。
 	PubPort int `json:"public_port"`
+	// MAC 填了之后，门户上这台资产会多一个「唤醒」按钮（网络唤醒 / WOL）。
+	// 魔术包由 home 端在内网广播出去——网关在公网上发不到目标网段。
+	MAC string `json:"mac"`
+	// 唤醒后用来判断「起来了没有」的地址，默认取 Target。
+	// 一台机器常常有多个身份（3389 的 PC 和 ssh 的同一台），填这个可以指定探哪个。
+	Check string `json:"check"`
 }
 
 type Config struct {
@@ -93,6 +99,9 @@ type Config struct {
 	// Guacamole 代登录（可选）。填了之后从门户点进 guacamole 就不需要再输一次
 	// Guacamole 自己的账号密码，网关会拿这里的账号先去换 token。
 	Guac *GuacSSO `json:"guacamole"`
+	// 网络唤醒（可选）。填了之后，配了 mac 的资产在门户上会出现「唤醒」按钮。
+	// 请求会经 SOCKS 转给 home 端的 WOL 接口，由它在家里的广播域真正发魔术包。
+	WOL *WOLConfig `json:"wol"`
 }
 
 // certReloader 按证书文件的 mtime 判断是否需要重读。
@@ -514,6 +523,16 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 网络唤醒：门户上的「唤醒」按钮打这两个接口
+	if path == "/__wake" {
+		g.handleWake(w, r)
+		return
+	}
+	if path == "/__wolstatus" {
+		g.handleWOLStatus(w, r)
+		return
+	}
+
 	// 自动登录脚本向这里取 Guacamole 的账号密码（同样在登录门之后）
 	if path == "/__guaccred" {
 		g.handleGuacCred(w, r)
@@ -684,14 +703,27 @@ body{margin:0;padding:20px;font:16px/1.6 -apple-system,"PingFang SC","Microsoft 
      background:#f5f6f8;color:#1a1a1a;-webkit-text-size-adjust:100%}
 h1{font-size:20px;margin:0 0 4px;font-weight:600}
 .sub{color:#777;font-size:14px;margin-bottom:18px}
-.card{display:block;background:#fff;border:1px solid #e2e4e8;border-radius:12px;
-      padding:16px 18px;margin-bottom:12px;text-decoration:none;color:inherit}
+.card{display:flex;flex-wrap:wrap;align-items:center;gap:10px;background:#fff;border:1px solid #e2e4e8;
+      border-radius:12px;padding:16px 18px;margin-bottom:12px;text-decoration:none;color:inherit}
 .card:active{background:#eef2f8}
-.row{display:flex;align-items:center;gap:12px}
+.card>a.row{text-decoration:none;color:inherit}
+.row{display:flex;align-items:center;gap:12px;flex:1;min-width:0}
+.tx{min-width:0}
 .ico{width:40px;height:40px;flex:0 0 40px;border-radius:10px;background:#e8f0fb;color:#185fa5;
      display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:600}
 .nm{font-size:17px;font-weight:500}
 .nt{color:#888;font-size:13px;margin-top:2px}
+/* 唤醒按钮：尺寸必须压过下面那条通用 button 规则（登录按钮要整宽，这个不要） */
+.wk{width:auto;flex:0 0 auto;padding:9px 14px;font-size:14px;font-weight:500;color:#fff;
+    background:#185fa5;border:0;border-radius:8px}
+.wk:active{background:#124a80}
+.wk:disabled{background:#9db4cd}
+/* 唤醒结果行：平时不占位，有内容才出现 */
+.wst{display:none;flex:1 0 100%;font-size:13px;margin-top:8px;color:#666;word-break:break-word}
+.wst.on{display:block}
+.wst.ok{color:#0a7d33}
+.wst.warn{color:#9a6700}
+.wst.bad{color:#b42318}
 .err{color:#b42318;background:#fdecea;border:1px solid #f5c2bd;border-radius:8px;
      padding:10px 12px;margin:0 0 14px}
 .note{color:#777;font-size:14px}
@@ -736,21 +768,41 @@ func (g *Gateway) portal(w http.ResponseWriter, r *http.Request) {
 
 	var b strings.Builder
 	b.WriteString(`<h1>内网入口</h1><p class="sub">点一下直接打开</p>`)
+	wakeReady := g.cfg.WOL != nil
+	wakeUsed := false
 	for _, a := range list {
 		icon := a.Icon
 		if icon == "" {
 			icon = "·"
 		}
-		if a.Port <= 0 && a.Sub == "" {
+		openable := a.Port > 0 || a.Sub != ""
+		canWake := wakeReady && a.MAC != ""
+		// 既打不开也唤不醒的资产不进门户（比如只配了名字的占位项）
+		if !openable && !canWake {
 			continue
 		}
-		b.WriteString(`<a class="card" href="` + html.EscapeString(g.pubURL(&a)) + `"><div class="row">`)
-		b.WriteString(`<div class="ico">` + html.EscapeString(icon) + `</div><div>`)
-		b.WriteString(`<div class="nm">` + html.EscapeString(a.Name) + `</div>`)
+		key := assetKey(&a)
+
+		b.WriteString(`<div class="card">`)
+		inner := `<div class="ico">` + html.EscapeString(icon) + `</div><div class="tx">`
+		inner += `<div class="nm">` + html.EscapeString(a.Name) + `</div>`
 		if a.Note != "" {
-			b.WriteString(`<div class="nt">` + html.EscapeString(a.Note) + `</div>`)
+			inner += `<div class="nt">` + html.EscapeString(a.Note) + `</div>`
 		}
-		b.WriteString(`</div></div></a>`)
+		inner += `</div>`
+		if openable {
+			b.WriteString(`<a class="row" href="` + html.EscapeString(g.pubURL(&a)) + `">` + inner + `</a>`)
+		} else {
+			// 只有 MAC 没有 Web 入口的设备（如开机后才连得上的 PC）：
+			// 整张卡就是唤醒入口
+			b.WriteString(`<div class="row">` + inner + `</div>`)
+		}
+		if canWake {
+			wakeUsed = true
+			b.WriteString(`<button class="wk" data-wake="` + html.EscapeString(key) + `">唤醒</button>`)
+			b.WriteString(`<div class="wst" data-k="` + html.EscapeString(key) + `"></div>`)
+		}
+		b.WriteString(`</div>`)
 	}
 	// 路径入口（Guacamole 之类）也列出来
 	pk := make([]string, 0, len(g.cfg.Paths))
@@ -783,6 +835,13 @@ func (g *Gateway) portal(w http.ResponseWriter, r *http.Request) {
 	b.WriteString(`<a class="card" href="/__passwd"><div class="row">`)
 	b.WriteString(`<div class="ico">K</div><div><div class="nm">修改密码</div>`)
 	b.WriteString(`<div class="nt">当前账号 ` + html.EscapeString(g.cfg.User) + `</div></div></div></a>`)
+
+	// 唤醒交互只在页面上确实有按钮时才注入，没配 WOL 的网关
+	// （或一台都没填 mac）连这段 JS 都不需要下载
+	if wakeUsed && g.cfg.WOL != nil {
+		b.WriteString(`<div id="wolcfg" data-wait="` + strconv.Itoa(g.cfg.WOL.WaitSeconds) + `" hidden></div>`)
+		b.WriteString(portalWOLJS)
+	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, pageTpl("内网入口", b.String()))
@@ -870,6 +929,16 @@ func main() {
 		log.Printf("Guacamole 代登录：%s 用账号 %q 自动登录（%s）",
 			cfg.Guac.Path, cfg.Guac.User, cfg.Guac.Target)
 	}
+	if cfg.WOL != nil {
+		n := 0
+		for i := range cfg.Assets {
+			if cfg.Assets[i].MAC != "" {
+				n++
+			}
+		}
+		log.Printf("网络唤醒：转给 home 的 %s，%d 台资产配了 MAC，等待上线 %ds",
+			cfg.WOL.Endpoint, n, cfg.WOL.WaitSeconds)
+	}
 
 	for _, ep := range eps {
 		ln, err := net.Listen("tcp", ep.addr)
@@ -932,5 +1001,8 @@ func (c *Config) normalize() {
 	}
 	if c.PortalSub == "" {
 		c.PortalSub = "portal"
+	}
+	if c.WOL != nil {
+		c.WOL.normalize()
 	}
 }
