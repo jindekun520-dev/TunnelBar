@@ -14,6 +14,34 @@ nc -z 203.0.113.10 7000                   # 家里能不能连到 relay
 
 判断顺序：**home 在线 → client 就绪 → SOCKS 监听了 → 目标端口通**。任何一环断了，后面的都是白费。
 
+## 只有某一台内网设备连不上（IP 漂移）
+
+其它设备都正常，就某一台（比如家里那台跑 home 的机器）突然拒绝连接——先怀疑 **DHCP 换了它的 IP**。
+
+隧道里**只认 IP，不做名称解析**：`-forward 10022:10.0.0.20:22`、菜单栏里的资产、`gateway.json` 里的 `target`、App 的 `probe`，全是写死的地址。租约一变，这些指向全部悬空，而且**隧道本身看着好好的**（relay 上 home 仍在线），最容易误判成隧道坏了。
+
+为什么 tunnel 本体不受影响：home 是**主动往外连 relay** 的，它自己内网地址变了照样能连出去（日志里会看到一次 `home 掉线 → 已注册 gen=N` 的重连，那就是 IP 变化的信号）。但别人要访问它时，用的还是配置里那个旧地址。
+
+从公网机器上经 SOCKS 验证（不要凭猜）：
+
+```bash
+# 在跑 client 的那台机器上，对比新旧地址
+curl -s --socks5 127.0.0.1:1080 --max-time 6 telnet://10.0.0.20:22   # 无输出 = 地址已悬空
+curl -s --socks5 127.0.0.1:1080 --max-time 6 telnet://10.0.0.91:22   # 有 SSH-2.0-... = 就是这台
+```
+
+改这些地方（都在**发起访问的那一侧**）：
+
+| 位置 | 字段 |
+| --- | --- |
+| 转发机 `systemctl cat <client>.service` | `-forward 本地端口:目标IP:目标端口` |
+| 菜单栏 App 的资产面板 | 该资产的 `host`、以及设置里的延迟探测 `probe`（`~/Library/Application Support/Tunnel/config.json`） |
+| `gateway.json` | 该资产的 `target`、`note` |
+
+改完 `systemctl daemon-reload && systemctl restart <client>.service`；App 要**完全退出再打开**（它只在启动时读配置）。
+
+**根治：在路由器上做 DHCP 静态绑定（MAC → IP）。** 不做绑定，下次租约到期还会再漂一次；而且漂的不只是这一台——NAS、Windows 机、任何被写进 `target` 或 `-forward` 的设备都应该绑。
+
 ## 日志说「握手失败: 解密失败」
 
 三端 `-key` 不一致。用 `KeyFingerprint()` 比对两端密钥指纹，不必打印密钥本身：
