@@ -195,7 +195,11 @@ struct Config: Codable {
         guard let f = parseForward(rule) else { return "http" }
         return guessScheme(remotePort: f.remote)
     }
-    /// 连通性探测目标，格式 host:port（走隧道访问）
+    /// 已废弃：老的「单独配置一个探测目标」。
+    ///
+    /// 这个字段要求手工维护一个和资产列表重复的地址，家里机器 DHCP 一换 IP
+    /// 就变成永久失败的靶子。现在菜单栏延迟直接取资产探测里最快的那台
+    /// （见 `probeAssets`），这里只为读旧配置时能解码，不再参与探测。
     var probe: String = ""
     /// 启动 App 时自动连接（服务端还是 v1 时先关掉，避免一开机就空转重连）
     var autoConnect: Bool = false
@@ -1303,6 +1307,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastAssetSig = ""
     private var lastForwardSig = ""
 
+    // MARK: 资产可达性
+
+    /// 单台资产的探测结果。只在内存里，不写盘——重启就该重新探。
+    private enum Reach {
+        case probing
+        case online(ms: Double)
+        case offline
+    }
+
+    /// key = asset.id。没有条目 = 还没探过。
+    ///
+    /// 为什么不再用配置里的 `probe`：那个字段要单独维护一个「和资产列表重复」的地址，
+    /// 家里机器 DHCP 一换 IP 就成了永久失败的靶子，还把日志刷满。现在延迟直接从
+    /// 这轮探测结果里取最快的在线资产，地址只存在资产列表这一处。
+    private var reach: [String: Reach] = [:]
+    private var reachAt: Date?
+    private var probingAssets = false
+    /// 打开面板时强制刷新的最小间隔：连点几次菜单不该发三遍探测
+    private let reachFreshWindow: TimeInterval = 5
+    /// 后台自动探测周期
+    private let reachInterval: TimeInterval = 60
+
+    private static let clock: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
     // 菜单项
     private let headerItem = NSMenuItem(title: "未连接", action: nil, keyEquivalent: "")
     private let trafficItem = NSMenuItem(title: "流量 —", action: nil, keyEquivalent: "")
@@ -1512,6 +1544,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildForwardMenu()
         rebuildPoolMenu()
         refreshTunItem()
+
+        // 打开面板就探一轮：用户看到的必须是新鲜结论，不是几十秒前的。
+        // 5 秒内刚探过的不再重复探（连点菜单不该发三遍探测请求）。
+        if !labMode, reachAt == nil || Date().timeIntervalSince(reachAt!) >= reachFreshWindow {
+            probeAssets(reason: "打开面板")
+        }
     }
 
     /// 「资产」子菜单：一个列表管所有内网入口。
@@ -1528,17 +1566,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let list = cfg.assets.filter { $0.enabled }
         resourcesItem.title = list.isEmpty ? "资产（未配置）" : "资产"
 
+        // 顶部两行：这些圆点是什么时候的结论，以及手动刷新入口。
+        // 不做这两行的话，用户看到「离线」会以为设备真挂了，其实是半小时前的旧结果。
+        if !list.isEmpty {
+            let stamp: String
+            if !runner.running {
+                stamp = "未连接"
+            } else if let t = reachAt {
+                stamp = "最后探测 " + AppDelegate.clock.string(from: t)
+            } else {
+                stamp = "正在探测…"
+            }
+            let head = NSMenuItem(title: "\(stamp) · 每 \(Int(reachInterval)) 秒自动刷新",
+                                  action: nil, keyEquivalent: "")
+            head.isEnabled = false
+            sub.addItem(head)
+
+            let refresh = NSMenuItem(title: "立即刷新状态", action: #selector(refreshAssetReach), keyEquivalent: "")
+            refresh.target = self
+            refresh.image = menuIcon("arrow.clockwise")
+            sub.addItem(refresh)
+            sub.addItem(.separator())
+        }
+
         for (idx, a) in list.enumerated() {
             let item = NSMenuItem(title: a.name, action: #selector(openAsset), keyEquivalent: "")
             item.target = self
             item.tag = idx
 
+            // 圆点优先级：本地转发没起来（一定打不开）> 探测结果 > 未知
             var prefix = "  "
+            var stateText: String?
+            switch reach[a.id] {
+            case .some(.probing):
+                prefix = "◌ "
+                stateText = "探测中…"
+            case .some(.online(let ms)):
+                prefix = "● "
+                stateText = String(format: "%.0f ms", ms)
+            case .some(.offline):
+                prefix = "○ "
+                stateText = "离线"
+            case .none:
+                break
+            }
+
             var detail: [String] = []
             if let lp = a.localPort {
-                prefix = isPortOpen(lp) ? "● " : "○ "
-                detail.append("转发 \(lp)")
+                if isPortOpen(lp) {
+                    detail.append("转发 \(lp)")
+                } else {
+                    // 转发端口没监听，走本地端口那条路必然失败，状态点也要跟着变
+                    prefix = "○ "
+                    stateText = "转发未就绪"
+                    detail.append("转发 \(lp)")
+                }
             }
+            if let st = stateText { detail.append(st) }
             detail.append(a.addr)
             if !a.user.isEmpty { detail.append(a.user) }
 
@@ -1863,6 +1947,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: 资产动作
 
+    /// 手动刷新资产状态（菜单里的「立即刷新状态」）。
+    ///
+    /// 打开面板时也会自动探一轮，这个入口是给「刚从休眠回来、想立刻确认真实状态」用的。
+    @objc private func refreshAssetReach() {
+        probeAssets(reason: "手动刷新")
+    }
+
     /// 点资产 → 先出一个小面板：连哪、用什么身份、能不能用，再决定打开还是别的。
     @objc private func openAsset(_ sender: NSMenuItem) {
         let list = cfg.assets.filter { $0.enabled }
@@ -1875,6 +1966,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.messageText = a.name
 
         var lines: [String] = []
+        // 状态放第一行：点开一台资产，最想先知道的就是「现在到底通不通」
+        switch reach[a.id] {
+        case .some(.probing):
+            lines.append("状态：探测中…")
+        case .some(.online(let ms)):
+            lines.append(String(format: "状态：● 在线 %.0f ms", ms))
+        case .some(.offline):
+            lines.append("状态：○ 离线")
+        case .none:
+            lines.append(runner.running ? "状态：未探测（打开菜单会自动探一轮）" : "状态：未连接")
+        }
         lines.append("\(a.scheme)://\(a.addr)")
         if let lp = a.localPort {
             lines.append("经本地转发 127.0.0.1:\(lp)" + (isPortOpen(lp) ? "（就绪）" : "（未就绪）"))
@@ -2561,6 +2663,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         appLog("\(reason)，重启 client")
         let wasLab = labMode
         runner.stop()
+        // 重启多半意味着资产地址/端口刚改过，旧的探测结论一律作废，等新一轮
+        reach = [:]
+        reachAt = nil
         if wasLab {
             startLab()
         } else {
@@ -2609,6 +2714,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         runner.stop()
         status = nil
         latency = nil
+        // 隧道断了，资产状态全部作废——留着会显示成一片过期的「在线」
+        reach = [:]
+        reachAt = nil
+        probingAssets = false
         labMode = false
         updateIcon(state: .off)
         refreshMenu()
@@ -2632,8 +2741,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let st {
             if st.ready {
                 updateIcon(state: st.poolAlive >= st.poolTotal ? .on : .degraded)
-                if latency == nil || latencyAt == nil || Date().timeIntervalSince(latencyAt!) > 15 {
-                    refreshLatency()
+                if labMode {
+                    if latency == nil || latencyAt == nil || Date().timeIntervalSince(latencyAt!) > 15 {
+                        refreshLatency()
+                    }
+                } else if reachAt == nil || Date().timeIntervalSince(reachAt!) >= reachInterval {
+                    // 后台兜底：60 秒一轮，只在隧道就绪时探，省得没连上也去刷失败
+                    probeAssets(reason: "定时")
                 }
             } else if (st.failCount ?? 0) > 0 && (st.okCount ?? 0) == 0 {
                 updateIcon(state: .degraded)
@@ -2733,25 +2847,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             + "title=\(button.title) hidden=\(button.isHidden) alpha=\(button.alphaValue)")
     }
 
+    /// 菜单栏那个「延迟」数字：直接取本轮探测里最快的在线资产。
+    ///
+    /// 不再自己发探测——探测统一由 `probeAssets()` 负责，这里只读结果。
+    /// 老实现每 2 秒探一次配置里写死的 `probe` 地址，那台机器 DHCP 换 IP 之后
+    /// 就变成永久失败的靶子，一天往日志里灌 8 万多条。
     private func refreshLatency() {
-        let socks = labMode ? cfg.labSocksPort : cfg.socksPort
-        let target = labMode ? "127.0.0.1:\(cfg.labSitePort)" : cfg.probe
-        // probe 没配就不探测，菜单里「延迟」显示为「—」，不发无效请求
-        guard !target.isEmpty else {
-            latency = nil
-            return
-        }
-        guard isPortOpen(socks) else {
-            latency = nil
-            return
-        }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let ms = socksProbe(socksPort: socks, target: target)
-            DispatchQueue.main.async {
-                self?.latency = ms
-                self?.latencyAt = Date()
-                self?.refreshMenu()
+        if labMode {
+            // 自测模式探的是本机站点，与资产列表无关，保持原逻辑
+            let socks = cfg.labSocksPort
+            guard isPortOpen(socks) else {
+                latency = nil
+                return
             }
+            let target = "127.0.0.1:\(cfg.labSitePort)"
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let ms = socksProbe(socksPort: socks, target: target)
+                DispatchQueue.main.async {
+                    self?.latency = ms
+                    self?.latencyAt = Date()
+                    self?.refreshMenu()
+                }
+            }
+            return
+        }
+
+        let best = reach.values.compactMap { r -> Double? in
+            if case .online(let ms) = r { return ms }
+            return nil
+        }.min()
+        latency = best
+        latencyAt = best == nil ? nil : reachAt
+    }
+
+    /// 探测所有启用的资产，结果写进 `reach`。
+    ///
+    /// 三个约束：
+    /// 1. **并发 3** —— 池连接总共 6 条，一次全占满会把正在用的隧道拖慢；
+    /// 2. **单台超时 1.5 秒** —— 内网设备要么秒回要么不在，等 5 秒没意义；
+    /// 3. **同一时刻只跑一轮** —— `probingAssets` 挡住重入，菜单连点不会叠加。
+    private func probeAssets(reason: String) {
+        guard runner.running, !probingAssets else { return }
+        let socks = labMode ? cfg.labSocksPort : cfg.socksPort
+        guard isPortOpen(socks) else { return }
+
+        let targets = cfg.assets.filter { $0.enabled && $0.port > 0 }
+        guard !targets.isEmpty else {
+            reach = [:]
+            reachAt = Date()
+            refreshLatency()
+            return
+        }
+
+        probingAssets = true
+        for a in targets { reach[a.id] = .probing }
+        refreshMenu()
+
+        let sem = DispatchSemaphore(value: 3)
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var results: [String: Reach] = [:]
+
+        for a in targets {
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                sem.wait()
+                defer { sem.signal(); group.leave() }
+                let ms = socksProbe(socksPort: socks, target: "\(a.host):\(a.port)", timeout: 1.5)
+                lock.lock()
+                results[a.id] = ms.map { .online(ms: $0) } ?? .offline
+                lock.unlock()
+            }
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            guard let self else { return }
+            self.reach = results
+            self.reachAt = Date()
+            self.probingAssets = false
+            self.refreshLatency()
+            self.refreshMenu()
+            let online = results.values.filter {
+                if case .online = $0 { return true }
+                return false
+            }.count
+            appLog("资产探测（\(reason)）：\(online)/\(targets.count) 在线")
         }
     }
 
@@ -2793,9 +2973,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if let ms = latency {
-            latencyItem.title = String(format: "延迟 %.0f ms（走隧道）", ms)
+            latencyItem.title = String(format: "延迟 %.0f ms（在线资产里最快的一台）", ms)
         } else {
-            latencyItem.title = runner.running ? "延迟 —（探测失败或隧道未就绪）" : "延迟 —"
+            latencyItem.title = runner.running ? "延迟 —（没有在线资产）" : "延迟 —"
         }
 
         refreshTunItem()
@@ -3024,10 +3204,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func runTest() {
         let socks = labMode ? cfg.labSocksPort : cfg.socksPort
-        let target = labMode ? "127.0.0.1:\(cfg.labSitePort)" : cfg.probe
+
+        // 探测目标不再单独配置：优先取本轮探测里最快的在线资产，
+        // 没探过就退到第一台启用资产，一台都没有才提示去添加。
+        // 这样地址只在资产列表里存一份，DHCP 换了 IP 也不会两处打架。
+        var target = labMode ? "127.0.0.1:\(cfg.labSitePort)" : ""
+        if !labMode {
+            let usable = cfg.assets.filter { $0.enabled && $0.port > 0 }
+            let fastest = usable.compactMap { a -> (String, Double)? in
+                if case .online(let ms) = reach[a.id] ?? .offline {
+                    return ("\(a.host):\(a.port)", ms)
+                }
+                return nil
+            }.min { $0.1 < $1.1 }
+            if let f = fastest {
+                target = f.0
+            } else if let first = usable.first {
+                target = "\(first.host):\(first.port)"
+            }
+        }
 
         guard !target.isEmpty else {
-            alert("还没配置探测目标", "请到「打开配置」里把 probe 填成一台内网主机的 host:port，例如 10.0.0.12:22。")
+            alert("还没有可用资产", "先在「资产」→「添加资产…」里加一台内网设备，再来测连通性。")
             return
         }
 

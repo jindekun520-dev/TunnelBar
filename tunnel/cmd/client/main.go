@@ -592,14 +592,15 @@ func handleSocks(c net.Conn, t *tunnel) {
 		return
 	}
 
+	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
 	st, err := t.open(host, port)
 	if err != nil {
-		if verbose {
-			log.Printf("[client] %s:%d 建连失败: %v", host, port, err)
-		}
+		// 去重：同一个目标连续失败只记第一条，恢复时补一条（见 diallog.go）
+		logDial(target, err)
 		socksReply(c, 0x05) // connection refused
 		return
 	}
+	logDial(target, nil)
 	if _, err := c.Write([]byte{socksVersion, 0x00, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0}); err != nil {
 		st.Reset(err)
 		return
