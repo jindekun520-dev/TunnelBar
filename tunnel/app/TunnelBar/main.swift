@@ -1291,6 +1291,79 @@ func makeLabSpecs(_ cfg: Config) -> [Runner.Spec] {
     ]
 }
 
+// MARK: - 点了不关菜单的菜单行
+
+/// 一行「点完菜单还开着」的菜单项。
+///
+/// NSMenu 的默认行为：点中任何一项，整张菜单立刻收起。想让「立即刷新状态」
+/// 点完还能盯着状态点变化，只能把这一项换成自定义 view——view 自己吃掉
+/// mouseDown，菜单的 tracking loop 收不到选中事件，就不会关闭菜单。
+///
+/// 这是 AppKit 里唯一不依赖私有 API 的做法；代价是这一行要自己画，
+/// 拿不到系统的悬停高亮，所以下面按菜单项的样子（图标列 + 正文基线）手绘。
+final class MenuClickRow: NSView {
+    /// 点击回调（在 mouseDown 时立刻派发，不等 mouseUp——菜单不一定还会送上来）
+    var onClick: (() -> Void)?
+
+    private let label: String
+    private let symbol: String?
+    private var pressed = false
+
+    init(label: String, symbol: String?, width: CGFloat) {
+        self.label = label
+        self.symbol = symbol
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 22))
+        // 菜单宽度由最宽的那一项决定；宽度跟着长，避免右侧留一段点不到的空白
+        autoresizingMask = [.width]
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let textColor: NSColor = pressed ? .selectedMenuItemTextColor : .labelColor
+        if pressed {
+            NSColor.selectedContentBackgroundColor.setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5).fill()
+        }
+
+        var textX: CGFloat = 10
+        if let sym = symbol, let img = tintedSymbol(sym, color: textColor) {
+            let sz = img.size
+            img.draw(in: NSRect(x: 10, y: (bounds.height - sz.height) / 2,
+                                width: sz.width, height: sz.height))
+            textX = 32   // 和系统菜单项的图标列对齐
+        }
+
+        let str = NSAttributedString(string: label, attributes: [
+            .font: NSFont.menuFont(ofSize: 0),
+            .foregroundColor: textColor,
+        ])
+        str.draw(at: NSPoint(x: textX, y: (bounds.height - str.size().height) / 2))
+    }
+
+    /// 菜单里没有控件替我们着色，模板图必须自己染成当前文字色，否则深色菜单下看不见
+    private func tintedSymbol(_ name: String, color: NSColor) -> NSImage? {
+        let conf = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+        guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
+        return base.withSymbolConfiguration(conf) ?? base
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        pressed = true
+        needsDisplay = true
+        // 异步派发：先让这一帧高亮画出来，再执行动作（探测是异步的，不会卡住菜单）
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.pressed = false
+            self.needsDisplay = true
+            self.onClick?()
+        }
+    }
+}
+
 // MARK: - 菜单栏应用
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -1328,6 +1401,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let reachFreshWindow: TimeInterval = 5
     /// 后台自动探测周期
     private let reachInterval: TimeInterval = 60
+
+    // MARK: 菜单开着时的原地刷新
+    //
+    // 菜单正显示着的时候不能重建（removeAllItems 会把菜单关掉），只能改已有那几行的文字。
+    // 这几个引用就是为「点刷新 / 60 秒自动探完，原地更新」准备的。
+
+    /// 菜单是否正开着（menuWillOpen / menuDidClose 维护）
+    private var menuIsOpen = false
+    /// 资产子菜单顶部那行「最后探测 xx:xx:xx」
+    private var reachHeadItem: NSMenuItem?
+    /// 资产子菜单里每一行的引用，顺序与 cfg.assets 过滤后的顺序一致
+    private var assetRowItems: [NSMenuItem] = []
+    /// 点「立即刷新状态」的时刻：万一 AppKit 还是把菜单关了，结果回来时自动重开一次
+    private var reopenAfterProbe: Date?
 
     private static let clock: DateFormatter = {
         let f = DateFormatter()
@@ -1540,6 +1627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         guard menu === statusItem.menu else { return }
+        menuIsOpen = true
         rebuildAssetMenu()
         rebuildForwardMenu()
         rebuildPoolMenu()
@@ -1550,6 +1638,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !labMode, reachAt == nil || Date().timeIntervalSince(reachAt!) >= reachFreshWindow {
             probeAssets(reason: "打开面板")
         }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard menu === statusItem.menu else { return }
+        menuIsOpen = false
     }
 
     /// 「资产」子菜单：一个列表管所有内网入口。
@@ -1568,23 +1661,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // 顶部两行：这些圆点是什么时候的结论，以及手动刷新入口。
         // 不做这两行的话，用户看到「离线」会以为设备真挂了，其实是半小时前的旧结果。
+        assetRowItems.removeAll()
+        reachHeadItem = nil
         if !list.isEmpty {
-            let stamp: String
-            if !runner.running {
-                stamp = "未连接"
-            } else if let t = reachAt {
-                stamp = "最后探测 " + AppDelegate.clock.string(from: t)
-            } else {
-                stamp = "正在探测…"
-            }
-            let head = NSMenuItem(title: "\(stamp) · 每 \(Int(reachInterval)) 秒自动刷新",
-                                  action: nil, keyEquivalent: "")
+            let head = NSMenuItem(title: reachStampText(), action: nil, keyEquivalent: "")
             head.isEnabled = false
             sub.addItem(head)
+            reachHeadItem = head
 
-            let refresh = NSMenuItem(title: "立即刷新状态", action: #selector(refreshAssetReach), keyEquivalent: "")
+            // 这一行用自定义 view：点它菜单不收起，探测结果直接在原菜单里刷新。
+            // 普通 NSMenuItem 一点就整张菜单收起，用户得再点一次才看得到新状态。
+            // item 的 action 保留当兜底：菜单比 view 宽时，点右侧空白仍能触发（走重开那条路）。
+            let refresh = NSMenuItem(title: "立即刷新状态",
+                                     action: #selector(refreshAssetReach), keyEquivalent: "")
             refresh.target = self
-            refresh.image = menuIcon("arrow.clockwise")
+            let row = MenuClickRow(label: "立即刷新状态", symbol: "arrow.clockwise", width: 300)
+            row.onClick = { [weak self] in self?.refreshAssetReach() }
+            refresh.view = row
             sub.addItem(refresh)
             sub.addItem(.separator())
         }
@@ -1593,56 +1686,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let item = NSMenuItem(title: a.name, action: #selector(openAsset), keyEquivalent: "")
             item.target = self
             item.tag = idx
-
-            // 圆点优先级：本地转发没起来（一定打不开）> 探测结果 > 未知
-            var prefix = "  "
-            var stateText: String?
-            switch reach[a.id] {
-            case .some(.probing):
-                prefix = "◌ "
-                stateText = "探测中…"
-            case .some(.online(let ms)):
-                prefix = "● "
-                stateText = String(format: "%.0f ms", ms)
-            case .some(.offline):
-                prefix = "○ "
-                stateText = "离线"
-            case .none:
-                break
-            }
-
-            var detail: [String] = []
-            if let lp = a.localPort {
-                if isPortOpen(lp) {
-                    detail.append("转发 \(lp)")
-                } else {
-                    // 转发端口没监听，走本地端口那条路必然失败，状态点也要跟着变
-                    prefix = "○ "
-                    stateText = "转发未就绪"
-                    detail.append("转发 \(lp)")
-                }
-            }
-            if let st = stateText { detail.append(st) }
-            detail.append(a.addr)
-            if !a.user.isEmpty { detail.append(a.user) }
-
-            let attr = NSMutableAttributedString(
-                string: prefix + a.name,
-                attributes: [.font: NSFont.menuFont(ofSize: 0)]
-            )
-            attr.append(NSAttributedString(
-                string: "   " + detail.joined(separator: " · "),
-                attributes: [
-                    .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
-                    .foregroundColor: NSColor.secondaryLabelColor,
-                ]
-            ))
-            item.attributedTitle = attr
+            item.attributedTitle = assetRowTitle(a)
             item.image = menuIcon(assetIcon(a.scheme))
             item.toolTip = a.localPort == nil
                 ? "\(a.scheme)://\(a.addr)（直连）"
                 : "\(a.scheme)://127.0.0.1:\(a.localPort!)（经本地转发到 \(a.addr)）"
             sub.addItem(item)
+            assetRowItems.append(item)
         }
 
         if !list.isEmpty { sub.addItem(.separator()) }
@@ -1710,6 +1760,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if sig != lastAssetSig {
             lastAssetSig = sig
             appLog("资产菜单重建：\(sig.isEmpty ? "（空）" : sig)")
+        }
+    }
+
+    /// 资产子菜单顶部那行时间戳：告诉用户这些圆点是「什么时候的结论」。
+    private func reachStampText() -> String {
+        let stamp: String
+        if !runner.running {
+            stamp = "未连接"
+        } else if let t = reachAt {
+            stamp = "最后探测 " + AppDelegate.clock.string(from: t)
+        } else {
+            stamp = "正在探测…"
+        }
+        return "\(stamp) · 每 \(Int(reachInterval)) 秒自动刷新"
+    }
+
+    /// 单台资产在菜单里那一行的富文本：圆点 + 名称 + 灰字详情。
+    ///
+    /// 抽出来是因为「菜单开着的时候要原地刷新」——重建菜单会把菜单关掉，
+    /// 所以刷新只能逐行重算标题，必须和首次构建走同一份逻辑。
+    private func assetRowTitle(_ a: Asset) -> NSAttributedString {
+        // 圆点优先级：本地转发没起来（一定打不开）> 探测结果 > 未知
+        var prefix = "  "
+        var stateText: String?
+        switch reach[a.id] {
+        case .some(.probing):
+            prefix = "◌ "
+            stateText = "探测中…"
+        case .some(.online(let ms)):
+            prefix = "● "
+            stateText = String(format: "%.0f ms", ms)
+        case .some(.offline):
+            prefix = "○ "
+            stateText = "离线"
+        case .none:
+            break
+        }
+
+        var detail: [String] = []
+        if let lp = a.localPort {
+            if isPortOpen(lp) {
+                detail.append("转发 \(lp)")
+            } else {
+                // 转发端口没监听，走本地端口那条路必然失败，状态点也要跟着变
+                prefix = "○ "
+                stateText = "转发未就绪"
+                detail.append("转发 \(lp)")
+            }
+        }
+        if let st = stateText { detail.append(st) }
+        detail.append(a.addr)
+        if !a.user.isEmpty { detail.append(a.user) }
+
+        let attr = NSMutableAttributedString(
+            string: prefix + a.name,
+            attributes: [.font: NSFont.menuFont(ofSize: 0)]
+        )
+        attr.append(NSAttributedString(
+            string: "   " + detail.joined(separator: " · "),
+            attributes: [
+                .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]
+        ))
+        return attr
+    }
+
+    /// 菜单正开着时把探测结果就地写进去。
+    ///
+    /// 不能重建子菜单（`removeAllItems` 会让正在跟踪的菜单错乱），只改已有行的文字，
+    /// 再 `update()` 让菜单重画。行数与资产数对不上（期间增删过资产）才退回重建。
+    private func applyReachToOpenMenu() {
+        let list = cfg.assets.filter { $0.enabled }
+        if let head = reachHeadItem { head.title = reachStampText() }
+        guard assetRowItems.count == list.count else {
+            rebuildAssetMenu()
+            return
+        }
+        for (i, a) in list.enumerated() {
+            assetRowItems[i].attributedTitle = assetRowTitle(a)
+        }
+        resourcesItem.submenu?.update()
+    }
+
+    /// 点「立即刷新状态」时若 AppKit 仍把菜单收起了，探测结果回来就把菜单再弹开。
+    ///
+    /// 只在用户确实点过刷新、且 8 秒内的短时间内重开，避免探测超时后突然弹出一个菜单。
+    private func reopenMenuIfNeeded() {
+        guard let t = reopenAfterProbe else { return }
+        reopenAfterProbe = nil
+        guard !menuIsOpen, Date().timeIntervalSince(t) < 8,
+              let button = statusItem.button else { return }
+        // 等上一轮 tracking 收尾，立刻 performClick 会被 AppKit 忽略
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            guard let self, !self.menuIsOpen else { return }
+            button.performClick(nil)
         }
     }
 
@@ -1950,8 +2096,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 手动刷新资产状态（菜单里的「立即刷新状态」）。
     ///
     /// 打开面板时也会自动探一轮，这个入口是给「刚从休眠回来、想立刻确认真实状态」用的。
+    /// 点它菜单不会关（那一行是自定义 view）；万一还是关了，探测完会自动弹回来。
     @objc private func refreshAssetReach() {
-        probeAssets(reason: "手动刷新")
+        let started = probeAssets(reason: "手动刷新")
+        reopenAfterProbe = Date()
+        if !started { reopenMenuIfNeeded() }   // 未连接等原因没探起来：立刻把菜单还回去
     }
 
     /// 点资产 → 先出一个小面板：连哪、用什么身份、能不能用，再决定打开还是别的。
@@ -2886,22 +3035,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 1. **并发 3** —— 池连接总共 6 条，一次全占满会把正在用的隧道拖慢；
     /// 2. **单台超时 1.5 秒** —— 内网设备要么秒回要么不在，等 5 秒没意义；
     /// 3. **同一时刻只跑一轮** —— `probingAssets` 挡住重入，菜单连点不会叠加。
-    private func probeAssets(reason: String) {
-        guard runner.running, !probingAssets else { return }
+    ///
+    /// 返回值表示这一轮是否真的开始了；没开始（未连接 / SOCKS 口没监听）时调用方
+    /// 不该等回调，否则「点刷新后自动重开菜单」永远等不到。
+    @discardableResult
+    private func probeAssets(reason: String) -> Bool {
+        guard runner.running, !probingAssets else { return false }
         let socks = labMode ? cfg.labSocksPort : cfg.socksPort
-        guard isPortOpen(socks) else { return }
+        guard isPortOpen(socks) else { return false }
 
         let targets = cfg.assets.filter { $0.enabled && $0.port > 0 }
         guard !targets.isEmpty else {
             reach = [:]
             reachAt = Date()
             refreshLatency()
-            return
+            if menuIsOpen { applyReachToOpenMenu() }
+            return false
         }
 
         probingAssets = true
         for a in targets { reach[a.id] = .probing }
         refreshMenu()
+        // 菜单开着时立刻把「◌ 探测中…」写进去，用户点完刷新能马上看到反馈
+        if menuIsOpen { applyReachToOpenMenu() }
 
         let sem = DispatchSemaphore(value: 3)
         let group = DispatchGroup()
@@ -2927,12 +3083,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.probingAssets = false
             self.refreshLatency()
             self.refreshMenu()
+            // 菜单还开着就原地改字（重建会把它关掉）；已经关了且是刚才点的刷新，就自动弹回来
+            if self.menuIsOpen {
+                self.reopenAfterProbe = nil
+                self.applyReachToOpenMenu()
+            } else {
+                self.reopenMenuIfNeeded()
+            }
             let online = results.values.filter {
                 if case .online = $0 { return true }
                 return false
             }.count
             appLog("资产探测（\(reason)）：\(online)/\(targets.count) 在线")
         }
+        return true
     }
 
     private func refreshMenu() {
