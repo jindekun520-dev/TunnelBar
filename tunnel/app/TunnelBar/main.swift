@@ -558,14 +558,38 @@ func startRDP(host: String, port: Int, user: String, assetID: String) -> String?
     let safe = assetID.replacingOccurrences(of: "/", with: "-")
     let file = dir.appendingPathComponent("\(safe).rdp")
 
+    // 参数按「40ms 往返 + 十来兆带宽的隧道」来配，但不是按局域网配。
+    //
+    // 这里有一条踩过的坑：**绝对不要设 `session bpp:i:16`**。16 位色会让
+    // Windows 关掉 DWM 桌面合成，Win10/11 上的表现就是登录后整屏黑，只剩零星
+    // 几个 GDI 元素（比如资源管理器的悬浮提示框）能画出来——看着像断线，其实
+    // 会话是通的。同理 `disable themes:i:1` 也会伤合成，一并去掉。
+    // 省带宽只能靠「降分辨率 + 压缩 + 关动画」，不能动色深和合成。
     var lines: [String] = [
         "full address:s:\(host):\(port)",
         "prompt for credentials:i:0",   // 凭据只问一次，不每轮重问
         "authentication level:i:2",     // 服务端证书不受信时提示，而不是直接连
-        "screen mode id:i:2",           // 全屏
+        // 窗口模式（不是全屏）：Retina 上全屏会按物理像素算，2880×1800 的差量
+        // 隧道喂不饱；开成 1600×900 的窗口，像素量直接降到约 1/4。
+        "screen mode id:i:1",
         "use multimon:i:0",
+        "desktopwidth:i:1600",
+        "desktopheight:i:900",
+        "smart sizing:i:1",
+        "session bpp:i:32",             // 必须 32：16 位会关掉 DWM，导致黑屏
+        "compression:i:1",
+        // 自适应：让它按「十来兆」估带宽，别假设成千兆局域网
+        "networkautodetect:i:1",
+        "bandwidthautodetect:i:1",
+        "connection type:i:7",          // 7 = 自动探测
+        // 只关节省带宽的动画类特效；壁纸/主题留着，否则桌面一片纯黑，
+        // 用户第一反应就是「又黑屏了」
+        "disable full window drag:i:1",
+        "disable menu anims:i:1",
+        "allow font smoothing:i:1",     // 小分辨率下 ClearType 能明显改善可读性
         "redirectclipboard:i:1",
-        "audiomode:i:0",
+        // 声音不重定向回本机：音频流是持续小包，在隧道里最容易被卡成断续
+        "audiomode:i:2",
         "autoreconnection enabled:i:1",
         "",
     ]
@@ -1472,6 +1496,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 资产行对应的自绘 view（按资产 id）。离线时点这一行是「唤醒」，菜单不能收起，
     /// 所以资产行也得是 MenuClickRow；重建时清空、原地刷新时按 id 取。
     private var assetRowViews: [String: MenuClickRow] = [:]
+    /// 点了资产行、但这台当时还没有探测结论（探测中 / 从没探过）的 id。
+    ///
+    /// 之前这里是「只有明确离线才唤醒」，于是探测还没回来那两秒里点下去，
+    /// 走的是打开面板那条路——用户看到的现象就是「点了不唤醒」。
+    /// 现在先挂起，等这一轮结果落定再按真实状态动手（离线→唤醒，在线→面板）。
+    private var pendingRowClicks: Set<String> = []
     /// 点「立即刷新状态」的时刻：万一 AppKit 还是把菜单关了，结果回来时自动重开一次
     private var reopenAfterProbe: Date?
     /// 唤醒后连续复探的代号（按资产 id）：重新点一次唤醒就作废上一轮的排期
@@ -1922,6 +1952,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "\(stamp) · 每 \(Int(reachInterval)) 秒自动刷新"
     }
 
+    /// 单台资产状态的一句话（日志用）
+    private func reachStateText(_ id: String) -> String {
+        switch reach[id] {
+        case .some(.probing): return "探测中"
+        case .some(.online(let ms)): return String(format: "在线 %.0f ms", ms)
+        case .some(.offline): return "离线"
+        case .none: return "未探测"
+        }
+    }
+
     /// 单台资产在菜单里那一行拆成「主文字 + 灰字」两段。
     ///
     /// 抽出来是因为三条路径都要同一份文案：首次构建、菜单开着时原地刷新、
@@ -1963,6 +2003,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if case .some(.offline) = reach[a.id], a.canWake {
             detail.append("点一下唤醒")
         }
+        // 在线时点它是开面板，但「我就想叫它醒一下」的需求还在，补一句 ⌥ 的用法
+        if case .some(.online) = reach[a.id], a.canWake {
+            detail.append("⌥点=唤醒")
+        }
         // 刚发过唤醒就把它写在后面：发送结果和复探结论（已唤醒 / 仍是离线）
         if let n = wakeNotes[a.id], Date().timeIntervalSince(n.at) < 300 {
             detail.append(n.text)
@@ -1989,25 +2033,105 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 资产行被点：离线且配了 MAC → 直接发唤醒包，**菜单不收起**；
     /// 其余情况（在线 / 没配 MAC / 还没探过）照旧关菜单、弹资产面板。
+    /// 资产行被点：按**当前探测结论**分流，并且把判断过程写进日志——
+    /// 「点了没反应」这类问题没有日志就永远只能猜。
+    ///
+    /// | 状态 | 动作 |
+    /// |---|---|
+    /// | 离线 + 有 MAC | 直接发唤醒包，菜单不收，可以接着点下一台 |
+    /// | 在线 | 关菜单、弹资产面板（面板里也有「唤醒」按钮，想强制叫醒走那儿） |
+    /// | 探测中 / 没探过 | 先挂起，等这一轮结果落定再按真实状态动手 |
     private func handleAssetRowClick(_ a: Asset, row: MenuClickRow) {
-        if case .some(.offline) = reach[a.id], a.canWake {
-            setWakeNote(a.id, "唤醒发送中…")
-            // 经隧道代发最坏等 8 秒超时，绝不能压在主线程上——菜单正开着
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self else { return }
-                let report = self.sendWake(a)
-                DispatchQueue.main.async {
-                    if let r = report {
-                        self.setWakeNote(a.id, "已发唤醒 · " + (r.ok ? "等它开机" : "没发出去"))
-                        self.scheduleWakeVerify(a)
-                    } else {
-                        self.setWakeNote(a.id, "MAC 不对，打不开唤醒")
-                    }
-                }
-            }
+        // 按住 ⌥ 点：不管理论上在线还是离线，直接把魔术包发出去。
+        // 存在的理由：在线判定只代表那个端口能握上手，用户想「强制叫醒」时不该被它拦住。
+        if a.canWake, NSEvent.modifierFlags.contains(.option) {
+            appLog("点资产 \(a.name)：按住 ⌥ → 强制发唤醒包（当前 \(reachStateText(a.id))）")
+            startWakeFromRow(a, row: row)
             return
         }
-        closeMenuThenOpenPanel(a)
+        let state = reachStateText(a.id)
+        switch reach[a.id] {
+        case .some(.online):
+            appLog("点资产 \(a.name)：\(state) → 打开面板（要强制唤醒请用「唤醒设备」或面板里的按钮）")
+            closeMenuThenOpenPanel(a)
+
+        case .some(.offline):
+            if a.canWake {
+                appLog("点资产 \(a.name)：\(state) + 配了 MAC → 发唤醒包")
+                startWakeFromRow(a, row: row)
+            } else {
+                appLog("点资产 \(a.name)：\(state) 但没配 MAC → 打开面板")
+                closeMenuThenOpenPanel(a)
+            }
+
+        case .some(.probing):
+            // 探测还在跑：这时候下任何结论都是错的，挂起等结果
+            pendingRowClicks.insert(a.id)
+            row.setDetail("探测中 · 出结果自动处理")
+            appLog("点资产 \(a.name)：探测中 → 等本轮结果再决定")
+
+        case .none:
+            // 一份结论都没有（刚启动 / 隧道没连上 / 之前被跳过）
+            pendingRowClicks.insert(a.id)
+            row.setDetail("确认状态…")
+            let started = probeAssets(reason: "点击待定")
+            appLog("点资产 \(a.name)：还没有探测结论 → \(started ? "立即补探一轮" : "探不起来，直接处理")")
+            if !started {
+                pendingRowClicks.remove(a.id)
+                if a.canWake { startWakeFromRow(a, row: row) } else { closeMenuThenOpenPanel(a) }
+            }
+        }
+    }
+
+    /// 探测结果落定后，处理「点了但当时没结论」的那几台
+    private func resolvePendingRowClicks() {
+        guard !pendingRowClicks.isEmpty else { return }
+        let ids = pendingRowClicks
+        pendingRowClicks.removeAll()
+        for id in ids {
+            guard let a = cfg.assets.first(where: { $0.id == id }) else { continue }
+            let row = assetRowViews[id]
+            switch reach[id] {
+            case .some(.online):
+                appLog("点资产 \(a.name)：补探结果在线 → 打开面板")
+                closeMenuThenOpenPanel(a)
+            case .some(.offline):
+                if a.canWake {
+                    appLog("点资产 \(a.name)：补探结果离线 → 发唤醒包")
+                    startWakeFromRow(a, row: row)
+                } else {
+                    appLog("点资产 \(a.name)：补探结果离线但没配 MAC → 打开面板")
+                    closeMenuThenOpenPanel(a)
+                }
+            default:
+                // 还是没结论（探测被取消 / 隧道刚断）：用户点的意图是要叫醒它
+                if a.canWake {
+                    appLog("点资产 \(a.name)：仍无结论 → 按唤醒处理")
+                    startWakeFromRow(a, row: row)
+                } else {
+                    closeMenuThenOpenPanel(a)
+                }
+            }
+        }
+    }
+
+    /// 从资产行发唤醒：结果写回该行，并盯一段时间的复探
+    private func startWakeFromRow(_ a: Asset, row: MenuClickRow?) {
+        setWakeNote(a.id, "唤醒发送中…")
+        row?.setDetail("唤醒发送中…")
+        // 经隧道代发最坏等 8 秒超时，绝不能压在主线程上——菜单正开着
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let report = self.sendWake(a)
+            DispatchQueue.main.async {
+                if let r = report {
+                    self.setWakeNote(a.id, "已发唤醒 · " + (r.ok ? "等它开机" : "没发出去"))
+                    self.scheduleWakeVerify(a)
+                } else {
+                    self.setWakeNote(a.id, "MAC 不对，打不开唤醒")
+                }
+            }
+        }
     }
 
     /// 唤醒后连续复探几轮，把「真的起来了」和「包发了但没反应」区分开。
@@ -2052,6 +2176,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.refreshAssetRow(a.id)
                     }
                 }
+                // 点了但当时没结论的，单台复探出结果也算结论
+                self.resolvePendingRowClicks()
             }
         }
     }
@@ -3383,11 +3509,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 self.reopenMenuIfNeeded()
             }
+            // 刚才点了但没结论的那几台，现在有结论了，该唤醒的唤醒、该开面板的开面板
+            self.resolvePendingRowClicks()
             let online = results.values.filter {
                 if case .online = $0 { return true }
                 return false
             }.count
-            appLog("资产探测（\(reason)）：\(online)/\(targets.count) 在线")
+            // 逐台结论也写进去：只有「8/10 在线」的时候，某台为什么点了不唤醒根本查不出来
+            let detail = targets.map { "\($0.name)=\(self.reachStateText($0.id))" }.joined(separator: "、")
+            appLog("资产探测（\(reason)）：\(online)/\(targets.count) 在线｜" + detail)
         }
         return true
     }

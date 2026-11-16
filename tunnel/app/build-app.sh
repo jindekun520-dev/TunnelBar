@@ -28,6 +28,11 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BUILD/TunnelBar" "$APP/Contents/MacOS/TunnelBar"
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
+# 版本号统一取 tunnel/VERSION，别让 Info.plist 里的 2.0.0 变成假版本
+VER="$(cat "$TUNNEL/VERSION" 2>/dev/null || echo "0.0.0")"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" "$APP/Contents/Info.plist" >/dev/null 2>&1 || true
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER" "$APP/Contents/Info.plist" >/dev/null 2>&1 || true
+echo "▸ 版本：$VER"
 cp "$HERE/app.icns" "$APP/Contents/Resources/app.icns"
 cp "$HERE/testsrv.py" "$APP/Contents/Resources/testsrv.py"
 
