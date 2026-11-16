@@ -969,7 +969,14 @@ func humanDuration(_ s: Int64) -> String {
 
 // MARK: - 应用日志
 
+/// 日志写入的互斥锁（后台线程也会调 appLog）
+private let appLogLock = NSLock()
+
 func appLog(_ msg: String) {
+    // 唤醒这类动作会在后台线程里发（经隧道代发可能等到 8 秒超时），
+    // 日志从两个线程同时写会串行错乱，这里加把锁
+    appLogLock.lock()
+    defer { appLogLock.unlock() }
     Paths.ensureDirs()
     let url = Paths.logs.appendingPathComponent("app.log")
     let fmt = DateFormatter()
@@ -1295,9 +1302,9 @@ func makeLabSpecs(_ cfg: Config) -> [Runner.Spec] {
 
 /// 一行「点完菜单还开着」的菜单项。
 ///
-/// NSMenu 的默认行为：点中任何一项，整张菜单立刻收起。想让「立即刷新状态」
-/// 点完还能盯着状态点变化，只能把这一项换成自定义 view——view 自己吃掉
-/// mouseDown，菜单的 tracking loop 收不到选中事件，就不会关闭菜单。
+/// NSMenu 的默认行为：点中任何一项，整张菜单立刻收起。像「唤醒设备」这种
+/// 一次要连点几台的操作，每点一次就得重开菜单，很别扭。换成自定义 view 后，
+/// view 自己吃掉 mouseDown，菜单的 tracking loop 收不到选中事件，就不会关闭。
 ///
 /// 这是 AppKit 里唯一不依赖私有 API 的做法；代价是这一行要自己画，
 /// 拿不到系统的悬停高亮，所以下面按菜单项的样子（图标列 + 正文基线）手绘。
@@ -1305,12 +1312,14 @@ final class MenuClickRow: NSView {
     /// 点击回调（在 mouseDown 时立刻派发，不等 mouseUp——菜单不一定还会送上来）
     var onClick: (() -> Void)?
 
-    private let label: String
-    private let symbol: String?
+    private var label: String
+    private var detail: String?
+    private var symbol: String?
     private var pressed = false
 
-    init(label: String, symbol: String?, width: CGFloat) {
+    init(label: String, detail: String? = nil, symbol: String?, width: CGFloat) {
         self.label = label
+        self.detail = detail
         self.symbol = symbol
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 22))
         // 菜单宽度由最宽的那一项决定；宽度跟着长，避免右侧留一段点不到的空白
@@ -1320,6 +1329,31 @@ final class MenuClickRow: NSView {
     required init?(coder: NSCoder) { nil }
 
     override var isFlipped: Bool { true }
+
+    /// 点完显示结果用：只改这一行的灰字，不重建菜单
+    func setDetail(_ text: String?) {
+        detail = text
+        needsDisplay = true
+    }
+
+    /// 切换型菜单项用（开机自启的勾/圈）
+    func setSymbol(_ name: String?) {
+        symbol = name
+        needsDisplay = true
+    }
+
+    func setLabel(_ text: String) {
+        label = text
+        needsDisplay = true
+    }
+
+    /// 菜单宽度可能被别的项撑得更宽，跟着长满，否则右侧那一段点下去会走回「关菜单」的老路
+    override func layout() {
+        super.layout()
+        if let sv = superview, sv.bounds.width > bounds.width + 0.5 {
+            setFrameSize(NSSize(width: sv.bounds.width, height: bounds.height))
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         let textColor: NSColor = pressed ? .selectedMenuItemTextColor : .labelColor
@@ -1336,11 +1370,21 @@ final class MenuClickRow: NSView {
             textX = 32   // 和系统菜单项的图标列对齐
         }
 
-        let str = NSAttributedString(string: label, attributes: [
+        let main = NSAttributedString(string: label, attributes: [
             .font: NSFont.menuFont(ofSize: 0),
             .foregroundColor: textColor,
         ])
-        str.draw(at: NSPoint(x: textX, y: (bounds.height - str.size().height) / 2))
+        main.draw(at: NSPoint(x: textX, y: (bounds.height - main.size().height) / 2))
+
+        // 右侧灰字：和资产行同一套视觉（主名称 + 小字说明），点完在这里回结果
+        if let d = detail, !d.isEmpty {
+            let sub = NSAttributedString(string: "   " + d, attributes: [
+                .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                .foregroundColor: pressed ? textColor.withAlphaComponent(0.9) : NSColor.secondaryLabelColor,
+            ])
+            sub.draw(at: NSPoint(x: textX + main.size().width,
+                                 y: (bounds.height - sub.size().height) / 2))
+        }
     }
 
     /// 菜单里没有控件替我们着色，模板图必须自己染成当前文字色，否则深色菜单下看不见
@@ -1354,7 +1398,7 @@ final class MenuClickRow: NSView {
     override func mouseDown(with event: NSEvent) {
         pressed = true
         needsDisplay = true
-        // 异步派发：先让这一帧高亮画出来，再执行动作（探测是异步的，不会卡住菜单）
+        // 异步派发：先让这一帧高亮画出来，再执行动作（动作别在这儿做重活，否则菜单会卡住）
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.pressed = false
@@ -1436,6 +1480,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let reloadItem = NSMenuItem(title: "重新加载配置", action: #selector(reloadConfig), keyEquivalent: "r")
     private let loginItem = NSMenuItem(title: "开机自启", action: #selector(toggleLogin), keyEquivalent: "")
     private let copySocksItem = NSMenuItem(title: "复制 SOCKS 地址", action: #selector(copySocks), keyEquivalent: "c")
+    /// 这两项点完菜单不该收起（一个是开关，一个可能想复制几次），所以用可点击行渲染
+    private var loginRow: MenuClickRow?
+    private var socksRow: MenuClickRow?
     private let resourcesItem = NSMenuItem(title: "资源", action: nil, keyEquivalent: "")
     private let forwardsItem = NSMenuItem(title: "端口转发", action: nil, keyEquivalent: "")
     private let poolItem = NSMenuItem(title: "连接池", action: nil, keyEquivalent: "")
@@ -1522,6 +1569,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.image = menuIcon(on ? onSymbol : offSymbol)
     }
 
+    /// 开机自启那一行的状态图标（勾/圈），自定义 view 拿不到 item.image，只能自己喂符号名。
+    private func loginRowSymbol() -> String {
+        LoginItem.enabled ? "checkmark.circle.fill" : "circle"
+    }
+
     private func buildMenu() {
         let menu = NSMenu()
         menu.delegate = self
@@ -1565,6 +1617,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tunItem.action = #selector(toggleTun)
         tunInfoItem.isEnabled = false
         tunInfoItem.isHidden = true
+
+        // 「开机自启」和「复制 SOCKS 地址」换成点了不关菜单的行：
+        // 前者是开关，后者常要连按两次确认；每点一次就收起菜单很打断。
+        // item 的 action 保留：⌘C 这类快捷键仍走老路，右侧空白处点到也不会失灵。
+        let loginRow = MenuClickRow(label: "开机自启", symbol: loginRowSymbol(), width: 320)
+        loginRow.onClick = { [weak self, weak loginRow] in
+            guard let self, let loginRow else { return }
+            self.applyLoginToggle(on: loginRow)
+        }
+        loginItem.view = loginRow
+        self.loginRow = loginRow
+
+        let socksRow = MenuClickRow(label: "复制 SOCKS 地址", symbol: "doc.on.doc", width: 320)
+        socksRow.onClick = { [weak self, weak socksRow] in
+            guard let self, let socksRow else { return }
+            let socks = self.labMode ? self.cfg.labSocksPort : self.cfg.socksPort
+            let text = "socks5h://127.0.0.1:\(socks)"
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            appLog("已复制 \(text)")
+            socksRow.setDetail("已复制 127.0.0.1:\(socks)")
+        }
+        copySocksItem.view = socksRow
+        self.socksRow = socksRow
 
         // 顶部：状态与诊断
         menu.addItem(headerItem)
@@ -1628,6 +1704,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         guard menu === statusItem.menu else { return }
         menuIsOpen = true
+        // 这两行是常驻的（不像资产行每次重建），上次点完留下的「已复制」要擦掉
+        loginRow?.setDetail(nil)
+        socksRow?.setDetail(nil)
         rebuildAssetMenu()
         rebuildForwardMenu()
         rebuildPoolMenu()
@@ -1728,25 +1807,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sub.addItem(rmRoot)
         }
 
-        // 只列出配了 MAC 的资产；一台都没配就整块不显示，免得菜单里多一行空的
+        // 只列出配了 MAC 的资产；一台都没配就整块不显示，免得菜单里多一行空的。
+        // 每一台都是「点了不关菜单」的行：唤醒 NAS、Windows、路由器要能连着点，
+        // 不用点一台重开一次菜单。结果直接写在这一行右边。
         let wakeIdxes = list.enumerated().filter { $0.element.canWake }.map { $0.offset }
         if !wakeIdxes.isEmpty {
             let wakeRoot = NSMenuItem(title: "唤醒设备", action: nil, keyEquivalent: "")
             wakeRoot.image = menuIcon("power")
             let ws = NSMenu()
+            ws.autoenablesItems = false
             for idx in wakeIdxes {
                 let a = list[idx]
-                let it = NSMenuItem(title: a.name, action: #selector(wakeAsset), keyEquivalent: "")
-                it.target = self
-                it.tag = idx
-                it.toolTip = "向 \(a.macText) 广播魔术包（端口 \(cfg.wolPort)）"
-                it.image = menuIcon("power")
+                let it = NSMenuItem(title: a.name, action: nil, keyEquivalent: "")
+                let row = MenuClickRow(label: a.name, symbol: "power", width: 240)
+                row.toolTip = "向 \(a.macText) 广播魔术包（端口 \(cfg.wolPort)）"
+                row.onClick = { [weak self, weak row] in
+                    guard let self, let row else { return }
+                    row.setDetail("发送中…")
+                    // 经隧道代发可能要等到 8 秒超时，绝不能卡在主线程——菜单正开着呢
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let report = self.sendWake(a)
+                        DispatchQueue.main.async {
+                            row.setDetail(report?.short ?? "MAC 不对")
+                        }
+                    }
+                }
+                it.view = row
                 ws.addItem(it)
             }
             ws.addItem(.separator())
-            let all = NSMenuItem(title: "唤醒全部（\(wakeIdxes.count) 台）", action: #selector(wakeAll), keyEquivalent: "")
-            all.target = self
-            ws.addItem(all)
+            let allItem = NSMenuItem(title: "唤醒全部", action: nil, keyEquivalent: "")
+            let allRow = MenuClickRow(label: "唤醒全部（\(wakeIdxes.count) 台）",
+                                      symbol: "power.circle", width: 240)
+            allRow.toolTip = "对以上每一台各发一轮魔术包"
+            allRow.onClick = { [weak self, weak allRow] in
+                guard let self, let allRow else { return }
+                allRow.setDetail("发送中…")
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let summary = self.wakeAllSilently()
+                    DispatchQueue.main.async { allRow.setDetail(summary) }
+                }
+            }
+            allItem.view = allRow
+            ws.addItem(allItem)
             wakeRoot.submenu = ws
             sub.addItem(wakeRoot)
         }
@@ -1852,6 +1955,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         reopenAfterProbe = nil
         guard !menuIsOpen, Date().timeIntervalSince(t) < 8,
               let button = statusItem.button else { return }
+        appLog("点刷新后菜单被收起，结果回来时自动弹回")
         // 等上一轮 tracking 收尾，立刻 performClick 会被 AppKit 忽略
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
             guard let self, !self.menuIsOpen else { return }
@@ -2165,50 +2269,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// 菜单「唤醒设备」里的入口（tag 对应 cfg.assets 过滤后的下标）
-    @objc private func wakeAsset(_ sender: NSMenuItem) {
-        let list = cfg.assets.filter { $0.enabled }
-        guard sender.tag >= 0, sender.tag < list.count else { return }
-        wakeNow(list[sender.tag])
+    /// 一次唤醒尝试的结果：菜单行里要一句短的，弹窗里要逐条细节，两份都从同一次发送里出。
+    private struct WakeReport {
+        let ok: Bool
+        /// 菜单行右侧的灰字（「已发 本机 2 包 · 隧道已代发」）
+        let short: String
+        /// 弹窗和日志里的逐条说明
+        let lines: [String]
     }
 
-    /// 一次把配了 MAC 的设备都唤醒（比如开机前把 NAS + Windows 一起叫起来）
-    @objc private func wakeAll() {
-        let targets = cfg.assets.filter { $0.enabled && $0.canWake }
-        guard !targets.isEmpty else { return }
-        var lines: [String] = []
-        for a in targets {
-            guard let macBytes = WOL.parseMAC(a.macText) else {
-                lines.append("\(a.name)：MAC 不对（\(a.macText)），跳过")
-                continue
-            }
-            var paths: [String] = []
-            let hosts = cfg.wolBroadcast.isEmpty ? WOL.localBroadcasts() : cfg.wolBroadcast
-            let local = WOL.send(macBytes, hosts: hosts, port: cfg.wolPort)
-            if local.sent > 0 { paths.append("本机 \(local.sent) 包") }
-            if cfg.wolViaTunnel {
-                if let err = WOL.wakeViaTunnel(endpoint: cfg.wolEndpoint, socksPort: cfg.socksPort,
-                                               mac: macBytes, port: cfg.wolPort) {
-                    paths.append("隧道失败：\(err)")
-                } else {
-                    paths.append("隧道已代发")
-                }
-            }
-            lines.append("\(a.name)：" + paths.joined(separator: " / "))
-        }
-        appLog("唤醒全部：" + lines.joined(separator: "；"))
-        alert("唤醒全部（\(targets.count) 台）", lines.joined(separator: "\n") + "\n\n等 30–90 秒再逐个打开。")
-    }
-
-    /// 唤醒一台设备：本机广播 + 经隧道代发，两条路都试，最后如实报告结果。
-    private func wakeNow(_ a: Asset) {
-        guard let macBytes = WOL.parseMAC(a.macText) else {
-            alertError("唤醒失败", "「\(a.name)」的 MAC 填得不对：\(a.macText.isEmpty ? "（空）" : a.macText)\n\n"
-                      + "应形如 AA:BB:CC:DD:EE:FF，也认 aa-bb-cc-dd-ee-ff 和裸 12 位十六进制。")
-            return
-        }
+    /// 真正发唤醒包：本机广播 + 经隧道代发，两条都试。
+    ///
+    /// MAC 填得不对返回 nil——调用方决定怎么报（菜单行里改字，或弹窗）。
+    /// 这个函数不弹任何窗口，所以菜单里可以连点，不会被打断。
+    private func sendWake(_ a: Asset) -> WakeReport? {
+        guard let macBytes = WOL.parseMAC(a.macText) else { return nil }
 
         var lines: [String] = []
+        var shortParts: [String] = []
         var ok = false
 
         // ① 本机广播：人在家里时这条就够
@@ -2217,6 +2295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if local.sent > 0 {
             ok = true
             lines.append("本机广播：已发出 \(local.sent) 个包 → " + local.used.joined(separator: "、"))
+            shortParts.append("本机 \(local.sent) 包")
         } else {
             lines.append("本机广播：没发出去（" + (local.errors.first ?? "找不到可广播的网卡") + "）")
         }
@@ -2226,16 +2305,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let err = WOL.wakeViaTunnel(endpoint: cfg.wolEndpoint, socksPort: cfg.socksPort,
                                            mac: macBytes, port: cfg.wolPort) {
                 lines.append("经隧道：\(err)")
+                shortParts.append("隧道失败")
             } else {
                 ok = true
                 lines.append("经隧道：家里主机已代发（\(cfg.wolEndpoint)）")
+                shortParts.append("隧道已代发")
             }
         }
 
         appLog("唤醒 \(a.name)（\(WOL.macString(macBytes))）：" + lines.joined(separator: "；"))
-        alert(ok ? "已发送唤醒包 · \(a.name)" : "唤醒包没发出去 · \(a.name)",
-              lines.joined(separator: "\n")
+        let short = shortParts.isEmpty ? "没发出去" : shortParts.joined(separator: " · ")
+        return WakeReport(ok: ok, short: short, lines: lines)
+    }
+
+    /// 唤醒一台设备并弹窗报告（资产面板里那个「唤醒」按钮走这条）。
+    ///
+    /// 菜单里的「唤醒设备 ▸」不走这里——那里要能连着点好几台，弹窗会把菜单顶掉。
+    private func wakeNow(_ a: Asset) {
+        guard let r = sendWake(a) else {
+            alertError("唤醒失败", "「\(a.name)」的 MAC 填得不对：\(a.macText.isEmpty ? "（空）" : a.macText)\n\n"
+                      + "应形如 AA:BB:CC:DD:EE:FF，也认 aa-bb-cc-dd-ee-ff 和裸 12 位十六进制。")
+            return
+        }
+        alert(r.ok ? "已发送唤醒包 · \(a.name)" : "唤醒包没发出去 · \(a.name)",
+              r.lines.joined(separator: "\n")
               + "\n\n开机到能连上一般要 30–90 秒。等一会儿再点「\(openButtonTitle(a.scheme))」。")
+    }
+
+    /// 一次把配了 MAC 的设备都唤醒（开机前把 NAS + Windows 一起叫起来）。
+    ///
+    /// 返回一句能塞进菜单行的短结论；每台的细节进日志。不弹窗，菜单不会被顶掉。
+    @discardableResult
+    private func wakeAllSilently() -> String {
+        let targets = cfg.assets.filter { $0.enabled && $0.canWake }
+        guard !targets.isEmpty else { return "没有配 MAC 的资产" }
+
+        var okCount = 0
+        var badMAC = 0
+        var details: [String] = []
+        for a in targets {
+            guard let r = sendWake(a) else {
+                badMAC += 1
+                details.append("\(a.name)：MAC 不对")
+                continue
+            }
+            if r.ok { okCount += 1 }
+            details.append("\(a.name)：" + r.short)
+        }
+        appLog("唤醒全部（\(okCount)/\(targets.count)）：" + details.joined(separator: "；"))
+
+        if okCount == 0 && badMAC > 0 { return "MAC 有问题（\(badMAC) 台）" }
+        if okCount == 0 { return "一台都没发出去" }
+        return "已发 \(okCount)/\(targets.count) 台"
     }
 
     private func openButtonTitle(_ scheme: String) -> String {
@@ -3144,7 +3265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         refreshTunItem()
         labItem.title = labMode ? "停止本机自测" : "启动本机自测（本机起 relay+home+站点）"
-        setToggle(loginItem, on: LoginItem.enabled, onSymbol: "arrow.right.to.line.circle.fill", offSymbol: "arrow.right.to.line.circle")
+        loginRow?.setSymbol(loginRowSymbol())
     }
 
     /// 菜单栏图标。
@@ -3446,18 +3567,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert("配置已重新加载", "relay = \(cfg.relay)\nSOCKS 端口 = \(cfg.socksPort)\n\n若正在连接，请断开后重连使其生效。")
     }
 
-    @objc private func toggleLogin() {
+    /// 开机自启开关。成功不弹窗（菜单还开着，弹窗会把菜单顶掉），结果写在行尾；
+    /// 只有真出错才弹，因为那时候必须让用户看见原因。
+    private func applyLoginToggle(on row: MenuClickRow?) {
         if LoginItem.enabled {
             LoginItem.disable()
-            refreshMenu()
-            return
-        }
-        if let err = LoginItem.enable() {
+            appLog("已关闭开机自启")
+            row?.setDetail("已关闭")
+        } else if let err = LoginItem.enable() {
             alert("开机自启设置失败", err)
+            row?.setDetail("设置失败")
         } else {
-            alert("已开启开机自启", "已写入 \(LoginItem.plistURL.path)\n下次登录会自动启动菜单栏。")
+            appLog("已开启开机自启（\(LoginItem.plistURL.path)）")
+            row?.setDetail("已开启")
         }
+        row?.setSymbol(loginRowSymbol())
         refreshMenu()
+    }
+
+    /// 快捷键（⌘ 组合）仍然走这个入口——菜单项被自定义 view 接管后，
+    /// 键盘触发不会走 view 的 onClick，这里补一次。
+    @objc private func toggleLogin() {
+        applyLoginToggle(on: loginRow)
     }
 
     /// 点诊断行：把完整报错复制到剪贴板，排查时直接甩给日志。
