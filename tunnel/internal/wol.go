@@ -27,6 +27,13 @@ const (
 	// 默认端口。历史上 0/7/9 都有人用，9（discard）最常见；
 	// 少数老网卡只监听 7，所以 Wake 允许显式指定。
 	DefaultWOLPort = 9
+
+	// 每个广播地址连发几份。网卡在深度省电（D3cold / 现代待机）状态下会漏掉
+	// 单个包，连发几份是各家 WOL 工具的常规做法；3 份 × 两个广播地址一共 6 个
+	// 102 字节的包，代价可以忽略。
+	DefaultWOLRepeats = 3
+	// 每份之间的间隔
+	wolRepeatGap = 120 * time.Millisecond
 )
 
 // ErrBadMAC 表示 MAC 字面量无法解析。
@@ -169,13 +176,24 @@ func Wake(mac net.HardwareAddr, broadcast []string, port int) (int, []string, er
 		}
 		enableBroadcast(c) // 显式开 SO_BROADCAST，不依赖运行时默认行为
 		_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		if _, err := c.Write(packet); err != nil {
-			errs = append(errs, addr+": "+err.Error())
-			_ = c.Close()
-			continue
+		written := 0
+		var werr error
+		for i := 0; i < DefaultWOLRepeats; i++ {
+			if _, err := c.Write(packet); err != nil {
+				werr = err
+				break
+			}
+			written++
+			if i+1 < DefaultWOLRepeats {
+				time.Sleep(wolRepeatGap)
+			}
 		}
 		_ = c.Close()
-		sent++
+		if written == 0 {
+			errs = append(errs, addr+": "+werr.Error())
+			continue
+		}
+		sent += written
 		if !dedup[host] {
 			dedup[host] = true
 			used = append(used, host)

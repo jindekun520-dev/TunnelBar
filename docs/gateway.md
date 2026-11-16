@@ -250,6 +250,7 @@ Guacamole 连进去之后，SSH/RDP 各自主机还要一次系统密码。给�
 | `wol.endpoint` | home 端唤醒接口地址，**从 home 的角度看**，通常就是 `127.0.0.1:9912` |
 | `wol.token` | 与 home 的 `-wol-token` 一致；home 没配令牌就留空 |
 | `wol.port` | 魔术包 UDP 端口，默认 9（少数老网卡只认 7） |
+| 发送份数 | 每个广播地址连发 3 份（间隔 120ms），网卡深度省电时会漏掉单个包 |
 | `wol.broadcast` | 指定广播地址；**推荐留空**，由 home 按各网卡自动算 |
 | `wol.wait_seconds` | 门户等待「上线」的上限，默认 90 秒 |
 

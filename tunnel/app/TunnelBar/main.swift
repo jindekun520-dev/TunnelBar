@@ -765,9 +765,13 @@ enum WOL {
         return out
     }
 
-    /// 往每个广播地址各发一个魔术包。多网卡机器上某块网卡发不出去很正常
+    /// 往每个广播地址各发几个魔术包。多网卡机器上某块网卡发不出去很正常
     /// （例如没插网线的 USB 网卡），只要有一份成功就算成功。
-    static func send(_ mac: [UInt8], hosts: [String], port: Int) -> (sent: Int, used: [String], errors: [String]) {
+    ///
+    /// 每个地址连发 3 份（间隔 120ms）：网卡在深度省电状态下会漏掉单个包，
+    /// 连发几份是各家 WOL 工具的通行做法，成本可以忽略。
+    static func send(_ mac: [UInt8], hosts: [String], port: Int,
+                     repeatCount: Int = 3) -> (sent: Int, used: [String], errors: [String]) {
         let pkt = packet(mac)
         var sent = 0
         var used: [String] = []
@@ -783,19 +787,27 @@ enum WOL {
             addr.sin_port = in_port_t(UInt16(port).bigEndian)
             addr.sin_addr.s_addr = inet_addr(host)
 
-            let n = pkt.withUnsafeBytes { raw -> Int in
-                withUnsafePointer(to: &addr) { ap -> Int in
-                    ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                        sendto(fd, raw.baseAddress, pkt.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            var okCount = 0
+            for i in 0..<max(1, repeatCount) {
+                let n = pkt.withUnsafeBytes { raw -> Int in
+                    withUnsafePointer(to: &addr) { ap -> Int in
+                        ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                            sendto(fd, raw.baseAddress, pkt.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
                     }
                 }
+                if n == pkt.count {
+                    okCount += 1
+                } else {
+                    errors.append("\(host)：sendto 返回 \(n)")
+                    break
+                }
+                if i + 1 < repeatCount { usleep(120_000) }
             }
             close(fd)
-            if n == pkt.count {
-                sent += 1
+            if okCount > 0 {
+                sent += okCount
                 if !used.contains(host) { used.append(host) }
-            } else {
-                errors.append("\(host)：sendto 返回 \(n)")
             }
         }
         return (sent, used, errors)
@@ -1457,8 +1469,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var reachHeadItem: NSMenuItem?
     /// 资产子菜单里每一行的引用，顺序与 cfg.assets 过滤后的顺序一致
     private var assetRowItems: [NSMenuItem] = []
+    /// 资产行对应的自绘 view（按资产 id）。离线时点这一行是「唤醒」，菜单不能收起，
+    /// 所以资产行也得是 MenuClickRow；重建时清空、原地刷新时按 id 取。
+    private var assetRowViews: [String: MenuClickRow] = [:]
     /// 点「立即刷新状态」的时刻：万一 AppKit 还是把菜单关了，结果回来时自动重开一次
     private var reopenAfterProbe: Date?
+    /// 唤醒后连续复探的代号（按资产 id）：重新点一次唤醒就作废上一轮的排期
+    private var wakeVerifyGen: [String: Int] = [:]
+    /// 唤醒结果的短句（按资产 id），显示在资产行灰字里，比弹窗更省事
+    private var wakeNotes: [String: (text: String, at: Date)] = [:]
+    /// 点了在线资产、等菜单收完再弹的面板目标
+    private var pendingPanel: Asset?
 
     private static let clock: DateFormatter = {
         let f = DateFormatter()
@@ -1722,6 +1743,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuDidClose(_ menu: NSMenu) {
         guard menu === statusItem.menu else { return }
         menuIsOpen = false
+        // 在线资产点下去要弹面板：等菜单真的收完再弹，别和 tracking loop 抢
+        if pendingPanel != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.flushPendingPanel()
+            }
+        }
     }
 
     /// 「资产」子菜单：一个列表管所有内网入口。
@@ -1761,8 +1788,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sub.addItem(.separator())
         }
 
+        assetRowViews.removeAll()
         for (idx, a) in list.enumerated() {
-            let item = NSMenuItem(title: a.name, action: #selector(openAsset), keyEquivalent: "")
+            let (label, detail) = assetRowParts(a)
+            // 资产行也用自绘 view：离线时点它是「唤醒」，菜单必须留着，
+            // 好让用户接着点下一台。在线时点它照旧关菜单并弹出资产面板。
+            let item = NSMenuItem(title: label, action: #selector(openAsset), keyEquivalent: "")
             item.target = self
             item.tag = idx
             item.attributedTitle = assetRowTitle(a)
@@ -1770,6 +1801,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.toolTip = a.localPort == nil
                 ? "\(a.scheme)://\(a.addr)（直连）"
                 : "\(a.scheme)://127.0.0.1:\(a.localPort!)（经本地转发到 \(a.addr)）"
+            let row = MenuClickRow(label: label, detail: detail,
+                                   symbol: assetIcon(a.scheme), width: 300)
+            row.toolTip = item.toolTip
+            row.onClick = { [weak self, weak row] in
+                guard let self, let row else { return }
+                self.handleAssetRowClick(a, row: row)
+            }
+            item.view = row
+            assetRowViews[a.id] = row
             sub.addItem(item)
             assetRowItems.append(item)
         }
@@ -1829,6 +1869,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         let report = self.sendWake(a)
                         DispatchQueue.main.async {
                             row.setDetail(report?.short ?? "MAC 不对")
+                            // 发完盯一会儿：只有复探上线才算真的唤醒成功
+                            self.setWakeNote(a.id, report == nil ? "MAC 不对" : "已发唤醒")
+                            if report != nil { self.scheduleWakeVerify(a) }
                         }
                     }
                 }
@@ -1879,11 +1922,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "\(stamp) · 每 \(Int(reachInterval)) 秒自动刷新"
     }
 
-    /// 单台资产在菜单里那一行的富文本：圆点 + 名称 + 灰字详情。
+    /// 单台资产在菜单里那一行拆成「主文字 + 灰字」两段。
     ///
-    /// 抽出来是因为「菜单开着的时候要原地刷新」——重建菜单会把菜单关掉，
-    /// 所以刷新只能逐行重算标题，必须和首次构建走同一份逻辑。
-    private func assetRowTitle(_ a: Asset) -> NSAttributedString {
+    /// 抽出来是因为三条路径都要同一份文案：首次构建、菜单开着时原地刷新、
+    /// 以及自绘 view 行（MenuClickRow 只吃两段字符串，吃不了富文本）。
+    private func assetRowParts(_ a: Asset) -> (label: String, detail: String) {
         // 圆点优先级：本地转发没起来（一定打不开）> 探测结果 > 未知
         var prefix = "  "
         var stateText: String?
@@ -1915,19 +1958,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let st = stateText { detail.append(st) }
         detail.append(a.addr)
         if !a.user.isEmpty { detail.append(a.user) }
+        // 离线且有 MAC：这一行点下去是唤醒，不是打开面板 —— 得说出来，
+        // 否则用户以为「点了没反应」，其实是包已经发出去了。
+        if case .some(.offline) = reach[a.id], a.canWake {
+            detail.append("点一下唤醒")
+        }
+        // 刚发过唤醒就把它写在后面：发送结果和复探结论（已唤醒 / 仍是离线）
+        if let n = wakeNotes[a.id], Date().timeIntervalSince(n.at) < 300 {
+            detail.append(n.text)
+        }
+        return (prefix + a.name, detail.joined(separator: " · "))
+    }
 
+    /// 把两段拼回富文本（普通 NSMenuItem 那条路仍需要 attributedTitle）
+    private func assetRowTitle(_ a: Asset) -> NSAttributedString {
+        let (label, detail) = assetRowParts(a)
         let attr = NSMutableAttributedString(
-            string: prefix + a.name,
+            string: label,
             attributes: [.font: NSFont.menuFont(ofSize: 0)]
         )
         attr.append(NSAttributedString(
-            string: "   " + detail.joined(separator: " · "),
+            string: "   " + detail,
             attributes: [
                 .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
                 .foregroundColor: NSColor.secondaryLabelColor,
             ]
         ))
         return attr
+    }
+
+    /// 资产行被点：离线且配了 MAC → 直接发唤醒包，**菜单不收起**；
+    /// 其余情况（在线 / 没配 MAC / 还没探过）照旧关菜单、弹资产面板。
+    private func handleAssetRowClick(_ a: Asset, row: MenuClickRow) {
+        if case .some(.offline) = reach[a.id], a.canWake {
+            setWakeNote(a.id, "唤醒发送中…")
+            // 经隧道代发最坏等 8 秒超时，绝不能压在主线程上——菜单正开着
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self else { return }
+                let report = self.sendWake(a)
+                DispatchQueue.main.async {
+                    if let r = report {
+                        self.setWakeNote(a.id, "已发唤醒 · " + (r.ok ? "等它开机" : "没发出去"))
+                        self.scheduleWakeVerify(a)
+                    } else {
+                        self.setWakeNote(a.id, "MAC 不对，打不开唤醒")
+                    }
+                }
+            }
+            return
+        }
+        closeMenuThenOpenPanel(a)
+    }
+
+    /// 唤醒后连续复探几轮，把「真的起来了」和「包发了但没反应」区分开。
+    ///
+    /// 发送成功只能证明包出去了；WOL 的坑几乎全在收端（MAC 不对、网卡没开
+    /// 唤醒、BIOS 关了 WOL、机器没接网线）。不回头看一眼，用户只知道「点了」，
+    /// 不知道到底成没成。
+    private func scheduleWakeVerify(_ a: Asset) {
+        let gen = (wakeVerifyGen[a.id] ?? 0) + 1
+        wakeVerifyGen[a.id] = gen
+        let delays: [Double] = [8, 20, 35, 55, 80]
+        for (i, d) in delays.enumerated() {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + d) { [weak self] in
+                guard let self, self.wakeVerifyGen[a.id] == gen else { return }
+                self.probeOneAsset(a, attempt: i + 1, total: delays.count, gen: gen)
+            }
+        }
+    }
+
+    /// 单台复探（唤醒后的验证用，不参与整轮探测的并发限制）
+    private func probeOneAsset(_ a: Asset, attempt: Int, total: Int, gen: Int) {
+        let socks = labMode ? cfg.labSocksPort : cfg.socksPort
+        guard runner.running, isPortOpen(socks) else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let ms = socksProbe(socksPort: socks, target: "\(a.host):\(a.port)", timeout: 1.5)
+            DispatchQueue.main.async {
+                guard self.wakeVerifyGen[a.id] == gen else { return }
+                if let ms {
+                    self.reach[a.id] = .online(ms: ms)
+                    self.wakeVerifyGen[a.id] = nil
+                    self.setWakeNote(a.id, "已唤醒")
+                    self.refreshLatency()
+                    appLog("唤醒复探：\(a.name) 已上线（\(Int(ms)) ms）")
+                } else {
+                    self.reach[a.id] = .offline
+                    if attempt >= total {
+                        self.wakeVerifyGen[a.id] = nil
+                        self.setWakeNote(a.id, "包已发 · 80 秒没上线")
+                        appLog("唤醒复探：\(a.name) 发出后 80 秒仍离线（查 MAC / 网卡唤醒设置 / 是否接网线）")
+                    } else {
+                        self.refreshAssetRow(a.id)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 关掉菜单再弹面板：NSAlert 是模态的，跟菜单的 tracking loop 同时开会打架。
+    /// 所以先 cancelTracking，真正弹窗放在 `menuDidClose` 之后（还有一个 1 秒兜底，
+    /// 万一 cancelTracking 没生效也不至于「点了完全没反应」）。
+    private func closeMenuThenOpenPanel(_ a: Asset) {
+        pendingPanel = a
+        statusItem.menu?.cancelTracking()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.flushPendingPanel()
+        }
+    }
+
+    private func flushPendingPanel() {
+        guard let a = pendingPanel else { return }
+        pendingPanel = nil
+        assetPanel(a)
     }
 
     /// 菜单正开着时把探测结果就地写进去。
@@ -1937,14 +2080,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func applyReachToOpenMenu() {
         let list = cfg.assets.filter { $0.enabled }
         if let head = reachHeadItem { head.title = reachStampText() }
-        guard assetRowItems.count == list.count else {
+        guard assetRowItems.count == list.count,
+              assetRowViews.count == list.count else {
             rebuildAssetMenu()
             return
         }
         for (i, a) in list.enumerated() {
             assetRowItems[i].attributedTitle = assetRowTitle(a)
+            if let row = assetRowViews[a.id] {
+                let (label, detail) = assetRowParts(a)
+                row.setLabel(label)
+                row.setDetail(detail)
+            }
         }
         resourcesItem.submenu?.update()
+    }
+
+    /// 只重画某一台资产那一行（唤醒结果、单台复探都走这条）
+    private func refreshAssetRow(_ id: String) {
+        guard let a = cfg.assets.first(where: { $0.id == id }) else { return }
+        let (label, detail) = assetRowParts(a)
+        assetRowViews[id]?.setLabel(label)
+        assetRowViews[id]?.setDetail(detail)
+        if let i = cfg.assets.filter({ $0.enabled }).firstIndex(where: { $0.id == id }),
+           i < assetRowItems.count {
+            assetRowItems[i].attributedTitle = assetRowTitle(a)
+        }
+        resourcesItem.submenu?.update()
+    }
+
+    /// 记一句唤醒结果，并立刻写进菜单里那一行
+    private func setWakeNote(_ id: String, _ text: String?) {
+        if let t = text {
+            wakeNotes[id] = (t, Date())
+        } else {
+            wakeNotes.removeValue(forKey: id)
+        }
+        refreshAssetRow(id)
     }
 
     /// 点「立即刷新状态」时若 AppKit 仍把菜单收起了，探测结果回来就把菜单再弹开。

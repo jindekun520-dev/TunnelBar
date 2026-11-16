@@ -94,7 +94,9 @@ func TestWakeSendsPacket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("发送失败：%v", err)
 	}
-	if sent != 1 || len(used) != 1 || used[0] != "127.0.0.1" {
+	// 每个目标连发 DefaultWOLRepeats 份（网卡深度省电时会漏包），
+	// 所以 sent 是份数、used 才是地址。
+	if sent != DefaultWOLRepeats || len(used) != 1 || used[0] != "127.0.0.1" {
 		t.Fatalf("发送统计不对：sent=%d used=%v", sent, used)
 	}
 
